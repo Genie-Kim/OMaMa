@@ -5,7 +5,7 @@ checkpoints/
 *.zip
 wandb/
 
-/home/compu/JinProjects/jinprojects/OMaMa/Ego-Exo4d
+Ego-Exo4d/
 
 .vscode/
 CLAUDE.md
