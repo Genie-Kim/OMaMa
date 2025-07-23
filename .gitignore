@@ -1,6 +1,7 @@
 *.pth*
 egoexo_v2_final/
 pretrained_models/
+qualitative_results/
 checkpoints/
 *.zip
 wandb/
