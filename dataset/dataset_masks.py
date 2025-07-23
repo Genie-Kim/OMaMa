@@ -73,9 +73,11 @@ class Masks_Dataset(Dataset):
         # Select the json file based on the train/test mode and reverse flag
         if self.train_mode:
             if self.reverse:
-                pairs_json = 'train_exoego_20percent_pairs.json' # We train with 20% of the pairs of the full trainig set
+                # pairs_json = 'train_exoego_20percent_pairs.json' # We train with 20% of the pairs of the full trainig set
+                pairs_json = 'train_exoego_pairs.json' # We train with 20% of the pairs of the full trainig set
             else:
-                pairs_json = 'train_egoexo_20percent_pairs.json' # We train with 20% of the pairs of the full trainig set
+                # pairs_json = 'train_egoexo_20percent_pairs.json' # We train with 20% of the pairs of the full trainig set
+                pairs_json = 'train_egoexo_pairs.json' # We train with 20% of the pairs of the full trainig set
         else:
             if self.test_mode:
                 if self.reverse:
@@ -86,9 +88,11 @@ class Masks_Dataset(Dataset):
             #Validation is just a subset of the test
             else:    
                 if self.reverse:
-                    pairs_json = 'custom_val_exoego_pairs_10.json' # We validate with 10% of the pairs of the full validation set
+                    # pairs_json = 'custom_val_exoego_pairs_10.json' # We validate with 10% of the pairs of the full validation set
+                    pairs_json = 'val_exoego_pairs.json' # We validate with 10% of the pairs of the full validation set
                 else:
-                    pairs_json = 'custom_val_egoexo_pairs_10.json' # We validate with 10% of the pairs of the full validation set
+                    # pairs_json = 'custom_val_egoexo_pairs_10.json' # We validate with 10% of the pairs of the full validation set
+                    pairs_json = 'val_egoexo_pairs.json' # We validate with 10% of the pairs of the full validation set
 
         print('----------------------------We are loading: ', pairs_json, 'with the pair of images')
         pairs = []

@@ -34,6 +34,17 @@ def convert_ndarray(obj):
     else:
         return obj
 
+
+"""
+python main_qual.py \                                   
+    --reverse \                                         
+    --root Ego-Exo4d \                                  
+    --devices 0 \                                       
+    --checkpoint_dir pretrained_models/Exo2Ego.pt \            
+    --exp_name Eval_OMAMA_0fe5b647
+"""
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Match masks from ego-exo pairs")
     parser.add_argument("--root", type=str, default="/media/maria/Datasets/Ego-Exo4d",help="Path to the dataset")
@@ -56,8 +67,8 @@ if __name__ == "__main__":
     else:
         device = 'cpu'
     
-    #The test dataset is the full validation dataset, used for the final evaluation
-    test_dataset = Masks_Dataset(args.root, args.patch_size, args.reverse, train = False, N_masks_per_batch=args.N_masks_per_batch,order = args.order, test = True)
+    #The validation dataset is used for evaluation
+    test_dataset = Masks_Dataset(args.root, args.patch_size, args.reverse, train = False, N_masks_per_batch=args.N_masks_per_batch,order = args.order, test = False)
     test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers = 1, pin_memory = True)
 
     descriptor_extractor = DescriptorExtractor('dinov2_vitb14_reg',  args.patch_size, args.context_size, device)
