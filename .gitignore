@@ -1,14 +1,18 @@
 *.pth*
+*.pt*
 egoexo_v2_final/
 pretrained_models/
 qualitative_results/
+exp_results/
 checkpoints/
 *.zip
 wandb/
+missing_mask_files.json
 
 Ego-Exo4d/
 
 .vscode/
+.claude/
 CLAUDE.md
 
 .vim-arsync

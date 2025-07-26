@@ -6,21 +6,7 @@ Refactored EgoExo4D FastSAM mask generator
 - Centralized logging setup
 - Argparse defaults cleaned (no interactive prompt). Set num_processes default=1
 - If num_processes == 1 -> run in current process (no mp overhead)
-# Train split - ego2exo direction
-echo "Processing train ego2exo..."
-python generate_masks.py --num_processes 10 --splits train --directions ego2exo --gpu_device 0
-
-# Train split - exo2ego direction  
-echo "Processing train exo2ego..."
-python generate_masks.py --num_processes 10 --splits train --directions exo2ego --gpu_device 1
-
-# Val split - ego2exo direction
-echo "Processing val ego2exo..."
-python generate_masks.py --num_processes 10 --splits val --directions ego2exo --gpu_device 2
-
-# Val split - exo2ego direction
-echo "Processing val exo2ego..."
-python generate_masks.py --num_processes 10 --splits val --directions exo2ego --gpu_device 3
+- Fixed ego/exo detection logic to use camera names instead of positional indices
 """
 
 import os
@@ -30,14 +16,14 @@ import argparse
 import logging
 import time
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Set
 
 import numpy as np
 import torch
+import cv2
 from tqdm import tqdm
 
 # Multiprocessing only when requested (>1 processes)
-import multiprocessing as mp
 from multiprocessing import Process, Queue
 
 # ----------------------------
@@ -75,6 +61,28 @@ def setup_logger(log_dir: Path, process_id: Optional[int] = None) -> logging.Log
 # Core util functions
 # ============================
 
+def get_fallback_masks_boxes(image_path: Path, logger: logging.Logger) -> Tuple[np.ndarray, np.ndarray]:
+    """Create fallback zero masks and boxes when FastSAM fails."""
+    try:
+        img = cv2.imread(str(image_path))
+        if img is None:
+            logger.warning(f"Could not load image for fallback: {image_path}")
+            # Use default dimensions if image loading fails
+            h, w = 1024, 1024
+        else:
+            h, w = img.shape[:2]
+        
+        # Return zero mask (1, H, W) and zero box (1, 4)
+        fallback_mask = np.zeros((1, h, w), dtype=np.uint8)
+        fallback_box = np.zeros((1, 4), dtype=np.float32)
+        return fallback_mask, fallback_box
+    except Exception as e:
+        logger.warning(f"Error creating fallback for {image_path}: {e}")
+        # Use default dimensions as last resort
+        fallback_mask = np.zeros((1, 1024, 1024), dtype=np.uint8)
+        fallback_box = np.zeros((1, 4), dtype=np.float32)
+        return fallback_mask, fallback_box
+
 def run_fastsam_on_image(image_path: Path,
                          model: FastSAM,
                          device: str,
@@ -88,7 +96,7 @@ def run_fastsam_on_image(image_path: Path,
         if not image_path.exists():
             logger.warning(f"Image not found: {image_path}")
             return None, None
-
+        
         everything_results = model(
             str(image_path),
             device=device,
@@ -97,33 +105,41 @@ def run_fastsam_on_image(image_path: Path,
             conf=conf,
             iou=iou
         )
+        
+        if not everything_results or len(everything_results) == 0:
+            # mask의 경우 shape (H, W) 인 zeros를 반환
+            # box의 경우 shape (1, 4) 인 zeros를 반환
+            logger.warning(f"No results from FastSAM for {image_path}")
+            return get_fallback_masks_boxes(image_path, logger)
+            
         prompt = FastSAMPrompt(str(image_path), everything_results, device=device)
 
-
-        mask_ann = prompt.results[0].masks.data # ex : torch.Size([N, H, W])
-        box_ann = prompt.results[0].boxes.xywh # ex : torch.Size([N, 4]) # 0:x1, 1:y1, 2:w, 3:h
-
-
-        if mask_ann is None or len(mask_ann) == 0:
-            logger.warning(f"No masks generated for {image_path}")
-            return None, None
+        mask_ann = prompt.results[0].masks.data
+        box_ann = prompt.results[0].boxes.xywh
 
         # Convert torch tensors to numpy
         masks = mask_ann.cpu().numpy().astype(np.uint8)  # Shape: [N, H, W]
         boxes = box_ann.cpu().numpy().astype(np.float32)  # Shape: [N, 4], format: [x, y, w, h]
 
         return masks, boxes
+    
     except Exception as e:
         logger.error(f"FastSAM error on {image_path}: {e}")
-        return None, None
+        return get_fallback_masks_boxes(image_path, logger)
 
+
+# Global cache for created directories to avoid redundant mkdir calls
+_created_dirs: Set[Path] = set()
 
 def save_outputs(masks: np.ndarray, boxes: np.ndarray,
                  out_root: Path, take_id: str, camera: str,
                  frame_idx: str, logger: logging.Logger) -> None:
     try:
         cam_dir = out_root / take_id / camera
-        cam_dir.mkdir(parents=True, exist_ok=True)
+        # Only create directory if not already created
+        if cam_dir not in _created_dirs:
+            cam_dir.mkdir(parents=True, exist_ok=True)
+            _created_dirs.add(cam_dir)
         np.savez_compressed(cam_dir / f"{frame_idx}_masks.npz", arr_0=masks)
         np.save(cam_dir / f"{frame_idx}_boxes.npy", boxes)
     except Exception as e:
@@ -135,28 +151,34 @@ def parse_processed_path(image_path: Path) -> Tuple[Optional[str], Optional[str]
     parts = image_path.parts
     try:
         idx = parts.index('processed')
-        take_id = parts[idx + 1]
-        camera = parts[idx + 2]
-        frame = Path(parts[idx + 3]).stem
-        return take_id, camera, frame
+        return parts[idx + 1], parts[idx + 2], Path(parts[idx + 3]).stem
     except (ValueError, IndexError):
         return None, None, None
 
 
 def json_key_to_local(path_str: str, dataset_root: Path, logger: logging.Logger) -> Optional[Path]:
     """Convert JSON path format to local filesystem path."""
+    UUID_LENGTH = 36
+    UUID_DASHES = 4
+    
     parts = [p for p in path_str.strip('/').split('//') if p]
-    take_id = camera = frame = None
     for i, p in enumerate(parts):
-        if len(p) == 36 and p.count('-') == 4:  # crude UUID check
+        if len(p) == UUID_LENGTH and p.count('-') == UUID_DASHES:  # crude UUID check
             take_id = p
             camera = parts[i + 1] if i + 1 < len(parts) else None
             frame = parts[-1]
+            if take_id and camera and frame:
+                return dataset_root / 'processed' / take_id / camera / f"{frame}.jpg"
             break
-    if not (take_id and camera and frame):
-        logger.warning(f"Could not parse JSON path: {path_str}")
-        return None
-    return dataset_root / 'processed' / take_id / camera / f"{frame}.jpg"
+    
+    logger.warning(f"Could not parse JSON path: {path_str}")
+    return None
+
+def is_exo_camera(camera_name: str) -> bool:
+    """Determine if camera is exocentric based on camera name.
+    Exocentric cameras contain 'cam' in their name, egocentric don't.
+    """
+    return 'cam' in camera_name.lower()
 
 
 def load_pairs(json_file: Path, logger: logging.Logger) -> List:
@@ -173,84 +195,134 @@ def load_pairs(json_file: Path, logger: logging.Logger) -> List:
 # Class wrapper
 # ============================
 class EgoExo4DMaskGenerator:
-    def __init__(self, dataset_root: str, fastsam_model_path: str, fastsam_path: str,
+    def __init__(self, dataset_root: str, fastsam_model_path: str,
                  logger: logging.Logger):
         self.dataset_root = Path(dataset_root)
         self.fastsam_model_path = fastsam_model_path
-        self.fastsam_path = fastsam_path
         self.logger = logger
 
         # Output dirs
         self.mask_dirs = {
-            'train_ego2exo': self.dataset_root / 'Masks_TRAIN_EGO2EXO',
-            'train_exo2ego': self.dataset_root / 'Masks_TRAIN_EXO2EGO',
-            'val_ego2exo': self.dataset_root / 'Masks_VAL_EGO2EXO',
-            'val_exo2ego': self.dataset_root / 'Masks_VAL_EXO2EGO',
-            'test_ego2exo': self.dataset_root / 'Masks_TEST_EGO2EXO',
-            'test_exo2ego': self.dataset_root / 'Masks_TEST_EXO2EGO',
+            'train_egoexo': self.dataset_root / 'Masks_TRAIN_EGO2EXO',
+            'train_exoego': self.dataset_root / 'Masks_TRAIN_EXO2EGO',
+            'val_egoexo': self.dataset_root / 'Masks_VAL_EGO2EXO',
+            'val_exoego': self.dataset_root / 'Masks_VAL_EXO2EGO',
+            'test_egoexo': self.dataset_root / 'Masks_TEST_EGO2EXO',
+            'test_exoego': self.dataset_root / 'Masks_TEST_EXO2EGO',
         }
         for d in self.mask_dirs.values():
             d.mkdir(parents=True, exist_ok=True)
 
     # -------- collection helpers ---------
-    def collect_image_jobs(self, splits: List[str], directions: List[str], resume: bool) -> List[Tuple[str, str, str, str, str]]:
+    def collect_missing_file_jobs(self, missing_file_path: str) -> List[Tuple[str, str, str, str, str]]:
+        """Collect jobs from missing_mask_files.json."""
+        jobs = []
+        
+        try:
+            with open(missing_file_path, 'r') as f:
+                missing_data = json.load(f)
+        except Exception as e:
+            self.logger.error(f"Failed to load missing file JSON: {e}")
+            return jobs
+        
+        # Process each split/direction combination
+        for json_file in ['train_egoexo_pairs.json', 'train_exoego_pairs.json', 'val_egoexo_pairs.json', 'val_exoego_pairs.json', 'test_egoexo_pairs.json', 'test_exoego_pairs.json']:
+            if json_file not in missing_data:
+                continue
+                
+            # Get the output directory for this split/direction
+            out_dir = self.mask_dirs.get('_'.join(json_file.split('_')[:2]))
+            if not out_dir:
+                self.logger.warning(f"Unknown mask directory : {out_dir}")
+                continue
+            
+            # Process each missing file entry
+            for entry in missing_data[json_file]:
+                take_id = entry['take_id']
+                camera = entry['camera']
+                frame = entry['frame']
+                
+                # Construct image path
+                img_path = self.dataset_root / 'processed' / take_id / camera / f"{frame}.jpg"
+                
+                # Only add if image exists
+                if img_path.exists():
+                    jobs.append((str(img_path), str(out_dir), take_id, camera, str(frame)))
+                else:
+                    self.logger.warning(f"Image not found for missing mask: {img_path}")
+        
+        self.logger.info(f"Collected {len(jobs)} missing file jobs to process")
+        return jobs
+    
+    def collect_image_jobs(self, split: str, direction: str, resume: bool) -> List[Tuple[str, str, str, str, str]]:
         mapping = {
-            ('train', 'ego2exo'): ('train_egoexo_pairs.json', 'train_ego2exo'),
-            ('train', 'exo2ego'): ('train_exoego_pairs.json', 'train_exo2ego'),
-            ('val', 'ego2exo'): ('val_egoexo_pairs.json', 'val_ego2exo'),
-            ('val', 'exo2ego'): ('val_exoego_pairs.json', 'val_exo2ego'),
-            ('test', 'ego2exo'): ('test_egoexo_pairs.json', 'test_ego2exo'),
-            ('test', 'exo2ego'): ('test_exoego_pairs.json', 'test_exo2ego'),
+            ('train', 'ego2exo'): ('train_egoexo_pairs.json', 'train_egoexo'),
+            ('train', 'exo2ego'): ('train_exoego_pairs.json', 'train_exoego'),
+            ('val', 'ego2exo'): ('val_egoexo_pairs.json', 'val_egoexo'),
+            ('val', 'exo2ego'): ('val_exoego_pairs.json', 'val_exoego'),
+            ('test', 'ego2exo'): ('test_egoexo_pairs.json', 'test_egoexo'),
+            ('test', 'exo2ego'): ('test_exoego_pairs.json', 'test_exoego'),
         }
         dataset_jsons_dir = self.dataset_root / 'dataset_jsons'
         jobs = []
 
-        for split in splits:
-            for direction in directions:
-                key = (split, direction)
-                if key not in mapping:
-                    continue
-                json_name, out_key = mapping[key]
-                json_file = dataset_jsons_dir / json_name
-                if not json_file.exists():
-                    self.logger.warning(f"Missing JSON {json_file}")
-                    continue
-                pairs = load_pairs(json_file, self.logger)
-                out_dir = self.mask_dirs[out_key]
+        key = (split, direction)
+        if key not in mapping:
+            self.logger.warning(f"Invalid split-direction combination: {key}")
+            return jobs
+        
+        json_name, out_key = mapping[key]
+        json_file = dataset_jsons_dir / json_name
+        if not json_file.exists():
+            self.logger.warning(f"Missing JSON {json_file}")
+            return jobs
+        
+        pairs = load_pairs(json_file, self.logger)
+        out_dir = self.mask_dirs[out_key]
 
-                for pair in pairs:
-                    if isinstance(pair, list) and len(pair) >= 2:
-                        ego_path = pair[0]
-                        exo_path = pair[2] if len(pair) > 2 else pair[1]
-                    elif isinstance(pair, dict):
-                        ego_path = pair.get('ego_rgb', pair.get('ego', ''))
-                        exo_path = pair.get('exo_rgb', pair.get('exo', ''))
-                    else:
-                        continue
+        for pair in pairs:
 
-                    for img_str in (ego_path, exo_path):
-                        if not img_str:
-                            continue
-                        img_path = json_key_to_local(img_str, self.dataset_root, self.logger)
-                        if img_path is None or not img_path.exists():
-                            continue
-                        take, cam, frame = parse_processed_path(img_path)
-                        if not (take and cam and frame):
-                            continue
-                        mask_file = out_dir / take / cam / f"{frame}_masks.npz"
-                        if resume and mask_file.exists():
-                            continue
-                        jobs.append((str(img_path), str(out_dir), take, cam, frame))
+            assert isinstance(pair, list), "Unknown JSON structure"
+
+            for img_str in pair:
+                img_path = json_key_to_local(img_str, self.dataset_root, self.logger)
+                if img_path is None or not img_path.exists():
+                    continue
+                take, cam, frame = parse_processed_path(img_path)
+                if not (take and cam and frame):
+                    continue
+                
+                # Validate camera type matches direction
+                is_exo = is_exo_camera(cam)
+                if direction == 'ego2exo' and not is_exo:
+                    continue  # Skip exo cameras for ego2exo direction
+                if direction == 'exo2ego' and is_exo:
+                    continue  # Skip ego cameras for exo2ego direction
+                    
+                mask_file = out_dir / take / cam / f"{frame}_masks.npz"
+                if resume and mask_file.exists():
+                    continue
+                jobs.append((str(img_path), str(out_dir), take, cam, frame))
         self.logger.info(f"Collected {len(jobs)} images to process")
         return jobs
 
     # -------- processing paths ---------
-    def _process_job(self, job, model, device, conf, iou, retina_masks, imgsz, logger):
+    @staticmethod
+    def _process_job(job, model, device, conf, iou, retina_masks, imgsz, logger):
+        """Process a single job (image) - unified function for single and multi-process modes."""
         img_path, out_dir, take, cam, frame = job
-        masks, boxes = run_fastsam_on_image(Path(img_path), model, device, conf, iou, retina_masks, imgsz, logger)
-        if masks is not None and boxes is not None:
-            save_outputs(masks, boxes, Path(out_dir), take, cam, frame, logger)
-            return True
+        
+        try:
+            masks, boxes = run_fastsam_on_image(Path(img_path), model, device, conf, iou, retina_masks, imgsz, logger)
+            if masks is not None and boxes is not None:
+                save_outputs(masks, boxes, Path(out_dir), take, cam, frame, logger)
+                # Clear GPU memory after processing
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return True
+        except Exception as e:
+            logger.error(f"Job processing error {take}/{cam}/{frame}: {e}")
+        
         return False
 
     def run_single_process(self, jobs: List[Tuple[str, str, str, str, str]],
@@ -258,50 +330,71 @@ class EgoExo4DMaskGenerator:
                            retina_masks: bool, imgsz: int) -> None:
         self.logger.info("Running in single-process mode")
         model = FastSAM(self.fastsam_model_path)
-        processed, errors = 0, 0
-        for job in tqdm(jobs, desc="Images"):
-            ok = self._process_job(job, model, device, conf, iou, retina_masks, imgsz, self.logger)
-            processed += int(ok)
-            errors += int(not ok)
-        self.logger.info(f"Done. processed={processed}, errors={errors}")
+        processed = 0
+        failed = 0
+        start_time = time.time()
+        
+        for i, job in enumerate(tqdm(jobs, desc="Images")):
+            ok = EgoExo4DMaskGenerator._process_job(job, model, device, conf, iou, retina_masks, imgsz, self.logger)
+            if ok:
+                processed += 1
+            else:
+                failed += 1
+            
+            # Batch progress reporting every 100 jobs
+            if (i + 1) % 100 == 0:
+                elapsed = time.time() - start_time
+                rate = (i + 1) / elapsed
+                self.logger.info(f"Progress: {i+1}/{len(jobs)} | Rate: {rate:.1f} img/s | Processed: {processed} | Failed: {failed}")
+        
+        self.logger.info(f"Done. processed={processed}, failed={failed}")
 
     # -------- multiprocessing ---------
     @staticmethod
     def worker(proc_id: int, jobs: List[Tuple[str, str, str, str, str]],
                device: str, fastsam_model_path: str,
                conf: float, iou: float, retina_masks: bool, imgsz: int,
-               progress_q: Queue, log_dir: Path, test_mode: bool = False):
+               progress_q: Queue, log_dir: Path, job_timeout: Optional[int] = None):
         logger = setup_logger(log_dir, proc_id)
         try:
             logger.info(f"Worker {proc_id} | {len(jobs)} images | device {device}")
             model = FastSAM(fastsam_model_path)
-            start = time.time()
-            count = 0
-            for job in jobs:
-                if test_mode and time.time() - start > 10:
-                    logger.info("Test mode timeout; exiting")
-                    break
-                ok = EgoExo4DMaskGenerator._static_process_job(job, model, device, conf, iou, retina_masks, imgsz, logger)
+            processed = 0
+            failed = 0
+            
+            # Track job start time if timeout is specified
+            if job_timeout is not None:
+                job_start = time.time()
+            
+            for i, job in enumerate(jobs):
+                ok = EgoExo4DMaskGenerator._process_job(job, model, device, conf, iou, retina_masks, imgsz, logger)
+                
                 if ok:
-                    count += 1
-                    progress_q.put(1)
-            logger.info(f"Worker {proc_id} finished. processed={count}")
+                    processed += 1
+                else:
+                    failed += 1
+                
+                # Report progress in batches
+                if (i + 1) % 10 == 0 or (i + 1) == len(jobs):
+                    progress_q.put({'processed': processed, 'failed': failed, 'total': i + 1})
+                
+                # Check job timeout if specified
+                if job_timeout is not None:
+                    job_duration = time.time() - job_start
+                    if job_duration > job_timeout:
+                        logger.error(f"Worker {proc_id} timeout: exceeded {job_timeout}s limit after {job_duration:.1f}s")
+                        break  # Exit the loop and terminate this worker process
+            
+            logger.info(f"Worker {proc_id} finished. processed={processed}, failed={failed}")
         except Exception as e:
             logger.error(f"Worker {proc_id} crashed: {e}")
-
-    @staticmethod
-    def _static_process_job(job, model, device, conf, iou, retina_masks, imgsz, logger):
-        img_path, out_dir, take, cam, frame = job
-        masks, boxes = run_fastsam_on_image(Path(img_path), model, device, conf, iou, retina_masks, imgsz, logger)
-        if masks is None or boxes is None:
-            return False
-        save_outputs(masks, boxes, Path(out_dir), take, cam, frame, logger)
-        return True
+            import traceback
+            logger.error(traceback.format_exc())
 
     def run_multi_process(self, jobs: List[Tuple[str, str, str, str, str]],
                           num_processes: int, device: str,
                           conf: float, iou: float, retina_masks: bool, imgsz: int,
-                          test_mode: bool, log_dir: Path):
+                          log_dir: Path, debug_timeout: Optional[int] = None):
         self.logger.info(f"Running in multi-process mode ({num_processes})")
         # Split jobs
         chunk = len(jobs) // num_processes
@@ -320,7 +413,7 @@ class EgoExo4DMaskGenerator:
         for i, js in enumerate(job_slices):
             p = Process(target=EgoExo4DMaskGenerator.worker,
                         args=(i, js, device, self.fastsam_model_path, conf, iou, retina_masks, imgsz,
-                              progress_q, log_dir, test_mode))
+                              progress_q, log_dir, debug_timeout))
             p.start()
             procs.append(p)
             self.logger.info(f"Spawned PID {p.pid}")
@@ -328,15 +421,31 @@ class EgoExo4DMaskGenerator:
         total = len(jobs)
         processed = 0
         start_time = time.time()
+        
         while any(p.is_alive() for p in procs):
             try:
+                current_time = time.time()
+                
+                # Process progress updates
+                progress_updates = []
                 while not progress_q.empty():
-                    progress_q.get_nowait()
-                    processed += 1
-                    elapsed = time.time() - start_time
-                    if processed:
-                        eta = (elapsed / processed) * (total - processed)
-                        self.logger.info(f"Progress {processed}/{total} ({processed/total*100:.1f}%) ETA {eta/60:.1f}m")
+                    try:
+                        update = progress_q.get_nowait()
+                        progress_updates.append(update)
+                    except:
+                        break
+                
+                # Aggregate progress updates
+                if progress_updates:
+                    total_processed = sum(u['processed'] for u in progress_updates)
+                    processed += total_processed
+                    
+                    elapsed = current_time - start_time
+                    if processed > 0:
+                        rate = processed / elapsed
+                        eta = (total - processed) / rate if rate > 0 else 0
+                        self.logger.info(f"Progress {processed}/{total} ({processed/total*100:.1f}%) | Rate: {rate:.1f} img/s | ETA {eta/60:.1f}m")
+                
                 time.sleep(1)
             except KeyboardInterrupt:
                 self.logger.info("Interrupt detected. Terminating children...")
@@ -344,8 +453,10 @@ class EgoExo4DMaskGenerator:
                     p.terminate()
                 break
 
+        # Wait for all processes to finish naturally
         for p in procs:
             p.join()
+                
         self.logger.info("All workers finished")
 
 # ============================
@@ -367,6 +478,8 @@ def build_parser():
                         help='CUDA device index to use')
     parser.add_argument('--num_processes', type=int, default=1,
                         help='Number of worker processes. 1 = no multiprocessing')
+    parser.add_argument('--debug_timeout', type=int, default=None,
+                        help='Timeout in seconds for worker processes (default: None, set for debugging)')
 
     parser.add_argument('--conf_threshold', type=float, default=0.4,
                         help='Confidence threshold')
@@ -374,22 +487,19 @@ def build_parser():
                         help='IoU threshold for NMS')
     parser.add_argument('--imgsz', type=int, default=1024,
                         help='Input resolution for FastSAM')
-    parser.add_argument('--retina_masks', action='store_true', default=True,
-                        help='Use retina masks (FastSAM option)')
-    parser.add_argument('--no-retina_masks', dest='retina_masks', action='store_false')
+    parser.add_argument('--retina_masks', type=bool, default=True,
+                        help='Use retina masks (FastSAM option, default: True)')
 
-    parser.add_argument('--splits', nargs='+', choices=['train', 'val', 'test'], default=['train', 'val'],
-                        help='Dataset splits to process')
-    parser.add_argument('--directions', nargs='+', choices=['ego2exo', 'exo2ego'], default=['ego2exo', 'exo2ego'],
-                        help='Directions to process')
-    parser.add_argument('--resume', action='store_true', default=True,
-                        help='Skip already processed frames')
-    parser.add_argument('--no-resume', dest='resume', action='store_false')
+    parser.add_argument('--split', choices=['train', 'val', 'test'], default='train',
+                        help='Dataset split to process')
+    parser.add_argument('--direction', choices=['ego2exo', 'exo2ego'], default='ego2exo',
+                        help='Direction to process')
+    parser.add_argument('--missing_file', type=str, default=None,
+                        help='Path to missing_mask_files.json file to process only missing masks')
+    parser.add_argument('--resume', type=bool, default=False,
+                        help='Skip already processed frames when not using missing_file mode')
 
-    parser.add_argument('--test_mode', action='store_true', default=False,
-                        help='Workers exit after 10s (debug)')
-
-    parser.add_argument('--log_dir', type=str, default='logs_masks',
+    parser.add_argument('--log_dir', type=str, default='logs_generating_masks',
                         help='Where to store log files')
 
     return parser
@@ -402,8 +512,7 @@ def main():
     # Inject FastSAM path
     sys.path.append(args.fastsam_path)
 
-    log_dir = Path(args.log_dir)
-    logger = setup_logger(log_dir)
+    logger = setup_logger(Path(args.log_dir))
 
     logger.info("Configuration:")
     for k, v in vars(args).items():
@@ -412,23 +521,29 @@ def main():
     # Initialize generator
     gen = EgoExo4DMaskGenerator(dataset_root=args.dataset_root,
                                 fastsam_model_path=os.path.join(args.fastsam_path, args.fastsam_model),
-                                fastsam_path=args.fastsam_path,
                                 logger=logger)
 
-    device = f"cuda:{args.gpu_device}"
-
-    # Collect jobs
-    jobs = gen.collect_image_jobs(args.splits, args.directions, args.resume)
+    # Collect jobs based on mode
+    if args.missing_file:
+        # Missing file mode - use JSON file
+        logger.info(f"Using missing file mode with: {args.missing_file}")
+        jobs = gen.collect_missing_file_jobs(args.missing_file)
+    else:
+        # Normal mode - use split/direction
+        jobs = gen.collect_image_jobs(args.split, args.direction, args.resume)
+    
     if not jobs:
         logger.info("Nothing to do. Exiting.")
         return
+    
+    device = f"cuda:{args.gpu_device}"
     if args.num_processes <= 1:
         gen.run_single_process(jobs, device, args.conf_threshold, args.iou_threshold,
                                args.retina_masks, args.imgsz)
     else:
         gen.run_multi_process(jobs, args.num_processes, device, args.conf_threshold,
                               args.iou_threshold, args.retina_masks, args.imgsz,
-                              args.test_mode, log_dir)
+                              Path(args.log_dir), args.debug_timeout)
 
     logger.info("Mask generation completed!")
 
