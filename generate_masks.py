@@ -73,13 +73,13 @@ def get_fallback_masks_boxes(image_path: Path, logger: logging.Logger) -> Tuple[
             h, w = img.shape[:2]
         
         # Return zero mask (1, H, W) and zero box (1, 4)
-        fallback_mask = np.zeros((1, h, w), dtype=np.uint8)
+        fallback_mask = np.zeros((h, w), dtype=np.uint8)
         fallback_box = np.zeros((1, 4), dtype=np.float32)
         return fallback_mask, fallback_box
     except Exception as e:
         logger.warning(f"Error creating fallback for {image_path}: {e}")
         # Use default dimensions as last resort
-        fallback_mask = np.zeros((1, 1024, 1024), dtype=np.uint8)
+        fallback_mask = np.zeros((1024, 1024), dtype=np.uint8)
         fallback_box = np.zeros((1, 4), dtype=np.float32)
         return fallback_mask, fallback_box
 
