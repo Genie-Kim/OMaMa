@@ -23,10 +23,14 @@ from dataset.dataset_utils import compute_IoU, compute_IoU_bbox, bbox_from_mask
 
 
 class Masks_Dataset(Dataset):
-    def __init__(self, root, patch_size, reverse, N_masks_per_batch, order, train, test):
+    def __init__(self, root, patch_size, reverse, N_masks_per_batch, order, train=False, test=False, val=False):
+        if not train and not test and not val:
+            raise ValueError("At least one of train, test, or val must be True")
+        
         self.root = root
         self.train_mode = train
         self.test_mode = test
+        self.val_mode = val
         self.reverse = reverse
 
         # Select the pre-extracted masks directory based on the train/test mode and reverse flag
@@ -65,7 +69,8 @@ class Masks_Dataset(Dataset):
         # Transformations for the images
         norm_mean, norm_std = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
         self.transform_img = transforms.Compose([transforms.ToTensor(), transforms.Normalize(norm_mean, norm_std)])
-
+        
+        
         print(len(self.takes_json), 'TAKES')
 
     # Load the json with the pairs
@@ -88,11 +93,11 @@ class Masks_Dataset(Dataset):
             #Validation is just a subset of the test
             else:    
                 if self.reverse:
-                    # pairs_json = 'custom_val_exoego_pairs_10.json' # We validate with 10% of the pairs of the full validation set
-                    pairs_json = 'val_exoego_pairs.json' # We validate with 10% of the pairs of the full validation set
+                    pairs_json = 'custom_val_exoego_pairs_10.json' # We validate with 10% of the pairs of the full validation set
+                    # pairs_json = 'val_exoego_pairs.json' # We validate with 10% of the pairs of the full validation set
                 else:
-                    # pairs_json = 'custom_val_egoexo_pairs_10.json' # We validate with 10% of the pairs of the full validation set
-                    pairs_json = 'val_egoexo_pairs.json' # We validate with 10% of the pairs of the full validation set
+                    pairs_json = 'custom_val_egoexo_pairs_10.json' # We validate with 10% of the pairs of the full validation set
+                    # pairs_json = 'val_egoexo_pairs.json' # We validate with 10% of the pairs of the full validation set
 
         print('----------------------------We are loading: ', pairs_json, 'with the pair of images')
         pairs = []
@@ -132,7 +137,7 @@ class Masks_Dataset(Dataset):
         h, w = img.shape[:2]
         if h > w:
             horiz_size = (h, w)
-            img = cv2.resize(img, horiz_size, interpolation=cv2.INTER_NEAREST)
+            img = cv2.resize(img, horiz_size, interpolation=cv2.INTER_NEAREST) # cv2.resize(img, (width, height)) expects (width, height) format
         return img
 
     # Select the adjacent negatives based on the adjacency matrix   
@@ -201,7 +206,7 @@ class Masks_Dataset(Dataset):
 
         # Image 1: SOURCE
         img1 = cv2.imread(f"{root}/{take_id}/{cam}/{vid_idx}.jpg")[..., ::-1]
-        if self.train_mode:
+        if self.train_mode or self.val_mode:
             img1 = self.check_horizontal(img1)
         img1 = self.reshape_img(img1)
         self.h1, self.w1 = img1.shape[:2]
@@ -217,7 +222,7 @@ class Masks_Dataset(Dataset):
         
         # Image 2: DESTINATION
         img2 = cv2.imread(f"{root2}/{take_id2}/{cam2}/{vid_idx2}.jpg")[..., ::-1]
-        if self.train_mode:
+        if self.train_mode or self.val_mode:
             img2 = self.check_horizontal(img2)
         img2 = self.reshape_img(img2)
         self.h2, self.w2 = img2.shape[:2]
@@ -288,6 +293,29 @@ class Masks_Dataset(Dataset):
             DEST_SAM_bboxes = torch.cat((NEG_part1_bboxes, POS_SAM_bboxes.unsqueeze(0), NEG_part2_bboxes), dim=0)
 
         # In validation or test modes, we just return the SAM masks, and precompute which is the best SAM mask
+        elif self.val_mode:
+            # Randomly sample N_masks_per_batch masks for validation batch processing
+            if SAM_masks.shape[0] >= self.N_masks_per_batch:
+                random_indices = np.random.choice(SAM_masks.shape[0], self.N_masks_per_batch, replace=False)
+            else:
+                random_indices = np.random.choice(SAM_masks.shape[0], self.N_masks_per_batch, replace=True)
+            
+            DEST_SAM_masks = SAM_masks[random_indices]
+            DEST_SAM_bboxes = SAM_bboxes_dest[random_indices]
+            
+            visible_pixels = mask2_GT.sum()
+            if visible_pixels > 0:
+                is_visible = torch.tensor(1.) # True
+                best_original = self.get_best_mask(SAM_masks, mask2_GT)
+                # Find position in sampled masks or default to 0
+                if best_original in random_indices:
+                    POS_mask_position = np.where(random_indices == best_original)[0][0]
+                else:
+                    POS_mask_position = 0
+            else:
+                is_visible = torch.tensor(0.) # False
+                POS_mask_position = 0
+                
         else:
             DEST_SAM_masks = SAM_masks
             visible_pixels = mask2_GT.sum()
