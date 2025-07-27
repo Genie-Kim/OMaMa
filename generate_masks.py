@@ -376,7 +376,7 @@ class EgoExo4DMaskGenerator:
                 
                 # Report progress in batches
                 if (i + 1) % 10 == 0 or (i + 1) == len(jobs):
-                    progress_q.put({'processed': processed, 'failed': failed, 'total': i + 1})
+                    progress_q.put({'proc_id': proc_id, 'processed': processed, 'failed': failed, 'total': i + 1})
                 
                 # Check job timeout if specified
                 if job_timeout is not None:
@@ -421,6 +421,8 @@ class EgoExo4DMaskGenerator:
         total = len(jobs)
         processed = 0
         start_time = time.time()
+        worker_progress = {}  # Track progress per worker
+        worker_stats = {}  # Track detailed stats per worker
         
         while any(p.is_alive() for p in procs):
             try:
@@ -437,14 +439,25 @@ class EgoExo4DMaskGenerator:
                 
                 # Aggregate progress updates
                 if progress_updates:
-                    total_processed = sum(u['processed'] for u in progress_updates)
-                    processed += total_processed
+                    # Update worker progress tracking
+                    for update in progress_updates:
+                        proc_id = update['proc_id']
+                        worker_progress[proc_id] = update['total']
+                        worker_stats[proc_id] = {
+                            'processed': update['processed'],
+                            'failed': update['failed']
+                        }
+                    
+                    # Calculate totals across all workers
+                    processed = sum(worker_progress.values())
+                    total_success = sum(stats['processed'] for stats in worker_stats.values())
+                    total_failed = sum(stats['failed'] for stats in worker_stats.values())
                     
                     elapsed = current_time - start_time
                     if processed > 0:
                         rate = processed / elapsed
                         eta = (total - processed) / rate if rate > 0 else 0
-                        self.logger.info(f"Progress {processed}/{total} ({processed/total*100:.1f}%) | Rate: {rate:.1f} img/s | ETA {eta/60:.1f}m")
+                        self.logger.info(f"Progress {processed}/{total} ({processed/total*100:.1f}%) | Success: {total_success} | Failed: {total_failed} | Rate: {rate:.1f} img/s | ETA {eta/60:.1f}m")
                 
                 time.sleep(1)
             except KeyboardInterrupt:
