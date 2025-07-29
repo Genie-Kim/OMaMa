@@ -5,10 +5,8 @@ import argparse
 from descriptors.get_descriptors import DescriptorExtractor
 from dataset.dataset_masks import Masks_Dataset
 from model.model import Attention_projector
-from evaluation import utils as eval_utils
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 from evaluation.evaluate import add_to_json, evaluate
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from pathlib import Path
 
 import helpers
@@ -42,12 +40,12 @@ def select_qualitative_samples(val_dataset, num_takes=3, frames_per_take=5):
     all_take_ids = list(take_to_pairs.keys())
     selected_take_ids = random.sample(all_take_ids, min(num_takes, len(all_take_ids)))
     
-    # Collect selected dataset indices
-    selected_indices = set()
+    # For each selected take_id, select up to frames_per_take frames
+    qualitative_selections = {}
     for take_id in selected_take_ids:
         pairs = take_to_pairs[take_id]
         # Sort by frame index
-        pairs.sort(key=lambda x: x[3])  # Sort by frame_idx which is at index 3
+        pairs.sort(key=lambda x: x[2])  # Sort by frame_idx which is now at index 2
         # Select evenly spaced frames
         if len(pairs) <= frames_per_take:
             selected_pairs = pairs
@@ -56,30 +54,21 @@ def select_qualitative_samples(val_dataset, num_takes=3, frames_per_take=5):
             indices = np.linspace(0, len(pairs)-1, frames_per_take, dtype=int)
             selected_pairs = [pairs[i] for i in indices]
         
-        # Add dataset indices to set
-        for idx, _, _, _ in selected_pairs:
-            selected_indices.add(idx)
+        # Store as (camera_name, object_name, frame_idx) for each take_id
+        qualitative_selections[take_id] = [(camera_name, object_name, frame_idx) for _, camera_name, object_name, frame_idx in selected_pairs]
     
-    return selected_indices
+    return qualitative_selections
 
 
 def run_validation(model, descriptor_extractor, val_dataloader, val_dataset, 
                    args, qualitative_dir, exp_dir, exp_name, current_epoch, 
-                   global_step, best_IoU, DEBUG_MODE, qualitative_indices):
+                   global_step, best_IoU, DEBUG_MODE, qualitative_selections):
     """Run validation and save checkpoints"""
     print(f'----- Step {global_step} (Epoch {current_epoch:.2f}) Validation -----')
     # Validation loop
+    processed_epoch, pred_json_epoch, gt_json_epoch = {}, {}, {}
     epoch_loss = 0
     qualitative_data = []  # Collect qualitative samples for batch processing
-    
-    # Accumulate metrics for immediate calculation (non-qualitative samples)
-    accumulated_ious = []
-    accumulated_shape_accs = []
-    accumulated_existence_accs = []
-    accumulated_location_scores = []
-    accumulated_obj_exist_gt = []
-    accumulated_obj_exist_pred = []
-    
     model.eval()
 
     for idx, batch in enumerate(tqdm(val_dataloader)):
@@ -102,52 +91,40 @@ def run_validation(model, descriptor_extractor, val_dataloader, val_dataset,
                 mask_idx = pred_masks_idx[b].item()
                 pred_mask = batch['DEST_SAM_masks'][b, mask_idx, :, :].detach().cpu().numpy()
                 
+                # Add to evaluation JSON
                 sample_pair_idx = batch['pair_idx'][b].item()
                 sample_confidence = confidence[b] if len(confidence.shape) > 0 else confidence
+                pred_json_epoch, gt_json_epoch = add_to_json(val_dataset, sample_pair_idx, 
+                                                            pred_mask, sample_confidence,
+                                                            processed_epoch, pred_json_epoch, gt_json_epoch)
                 
-                # Use pre-loaded GT mask from batch (already decoded and resized - no duplicate loading)
-                gt_mask = batch['GT_mask'][b].cpu().numpy()
-                gt_obj_exists = int(batch['is_visible'][b].item())
+                # Generate qualitative outputs for pre-selected samples
+                # Extract take_id, camera_name, object_name, and frame_idx from the image path
+                img_path, _, _, _ = val_dataset.pairs[sample_pair_idx]
+                _, take_id, camera_name, object_name, _, frame_idx = img_path.split('//')
+                frame_idx = int(frame_idx)
                 
-                if gt_obj_exists:
-                    # Calculate metrics immediately (GT mask already properly sized)
-                    iou, shape_acc = eval_utils.eval_mask(gt_mask, pred_mask)
-                    existence_acc = eval_utils.existence_accuracy(gt_mask, pred_mask)
-                    location_score = eval_utils.location_score(gt_mask, pred_mask, 
-                                                             size=(gt_mask.shape[0], gt_mask.shape[1]))
-                    
-                    accumulated_ious.append(iou)
-                    accumulated_shape_accs.append(shape_acc)
-                    accumulated_existence_accs.append(existence_acc)
-                    accumulated_location_scores.append(location_score)
-                
-                # Track object existence for balanced accuracy
-                pred_obj_exists = int(sample_confidence > 0.5)  # CONF_THRESH = 0.5
-                accumulated_obj_exist_gt.append(gt_obj_exists)
-                accumulated_obj_exist_pred.append(pred_obj_exists)
-                
-                # Generate qualitative outputs for pre-selected samples (visualization only)
-                if sample_pair_idx in qualitative_indices:
-                    # Extract metadata for visualization filename
-                    img_path, _, _, _ = val_dataset.pairs[sample_pair_idx]
-                    _, take_id, _, object_name, _, frame_idx = img_path.split('//')
-                    frame_idx = int(frame_idx)
-                    
-                    # Create batch-specific data for visualization
-                    sample_batch = {
-                        'SOURCE_img': batch['SOURCE_img'][b:b+1],
-                        'GT_img': batch['GT_img'][b:b+1], 
-                        'SOURCE_mask': batch['SOURCE_mask'][b:b+1],
-                        'GT_mask': batch['GT_mask'][b:b+1]
-                    }
-                    # Collect qualitative data for batch processing
-                    qualitative_data.append({
-                        'sample_batch': sample_batch,
-                        'pred_mask': pred_mask,
-                        'take_id': take_id,
-                        'object_name': object_name,
-                        'frame_idx': frame_idx
-                    })
+                # Check if this sample is in pre-selected qualitative samples
+                if take_id in qualitative_selections:
+                    # Check if this specific (camera_name, object_name, frame_idx) is selected
+                    selected_pairs = qualitative_selections[take_id]
+                    if any(camera_name == sel_camera and object_name == sel_object and frame_idx == sel_frame 
+                           for sel_camera, sel_object, sel_frame in selected_pairs):
+                        # Create batch-specific data for visualization
+                        sample_batch = {
+                            'SOURCE_img': batch['SOURCE_img'][b:b+1],
+                            'GT_img': batch['GT_img'][b:b+1], 
+                            'SOURCE_mask': batch['SOURCE_mask'][b:b+1],
+                            'GT_mask': batch['GT_mask'][b:b+1]
+                        }
+                        # Collect qualitative data for batch processing
+                        qualitative_data.append({
+                            'sample_batch': sample_batch,
+                            'pred_mask': pred_mask,
+                            'take_id': take_id,
+                            'object_name': object_name,
+                            'frame_idx': frame_idx
+                        })
 
             
             # Debug mode: limit validation iterations
@@ -156,32 +133,7 @@ def run_validation(model, descriptor_extractor, val_dataloader, val_dataset,
 
     epoch_loss /= len(val_dataloader)
     print(f'----- Step {global_step} (Epoch {current_epoch:.2f}) metrics -----')
-    
-    # Calculate final metrics from accumulated values (memory efficient)
-    if accumulated_ious:
-        avg_iou = np.mean(accumulated_ious)
-        avg_shape_acc = np.mean(accumulated_shape_accs) 
-        avg_existence_acc = np.mean(accumulated_existence_accs)
-        avg_location_score = np.mean(accumulated_location_scores)
-        
-        # Calculate balanced accuracy for object existence
-        from sklearn.metrics import balanced_accuracy_score
-        balanced_acc = balanced_accuracy_score(accumulated_obj_exist_gt, accumulated_obj_exist_pred) if accumulated_obj_exist_gt else 0.0
-        
-        out_dict = {
-            'iou': avg_iou,
-            'shape_accuracy': avg_shape_acc,
-            'existence_accuracy': avg_existence_acc,  
-            'location_score': avg_location_score,
-            'balanced_accuracy': balanced_acc
-        }
-        
-        print(f"Evaluated {len(accumulated_ious)} samples with memory-efficient calculation")
-    else:
-        # Fallback (should not happen)
-        out_dict = {
-            'iou': 0.0, 'shape_accuracy': 0.0, 'existence_accuracy': 0.0, 'location_score': 0.0, 'balanced_accuracy': 0.0
-        }  
+    out_dict = evaluate(gt_json_epoch, pred_json_epoch, args.reverse)  
     
     # Process all qualitative visualizations at once
     if qualitative_data:
@@ -323,7 +275,7 @@ if __name__ == "__main__":
     # Debug mode for development
     DEBUG_MODE = args.debug
 
-    helpers.set_all_seeds(47)
+    helpers.set_all_seeds(42)
     if args.devices != "cpu":
         gpus = [args.devices]  # Specify which GPUs to use
         device_ids = [f'cuda:{gpu}' for gpu in gpus]
@@ -334,16 +286,16 @@ if __name__ == "__main__":
     
     # Training dataset only contains horizontal images, in order to batchify the masks
     train_dataset = Masks_Dataset(args.root, args.patch_size, args.reverse, N_masks_per_batch=args.N_masks_per_batch, order = args.order, train = True)
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=helpers.our_collate_fn, num_workers = 4, pin_memory = True, prefetch_factor=4) #16 in both
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=helpers.our_collate_fn, num_workers = 4, pin_memory = True, prefetch_factor=4,persistent_workers=True) #16 in both
     
     # Validation dataset contains both horizontal and vertical images. Now supports batch processing for efficiency
     # Note: the val annotations are a small subset of the full validation dataset, used for eval the training per epoch
-    val_dataset = Masks_Dataset(args.root, args.patch_size, args.reverse, N_masks_per_batch = args.N_masks_per_batch,  order = args.order, val = True)
-    val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=helpers.our_collate_fn, num_workers = 2, shuffle=False, pin_memory = True, prefetch_factor=2)
+    val_dataset = Masks_Dataset(args.root, args.patch_size, args.reverse, N_masks_per_batch = 48,  order = args.order, val = True)
+    val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=helpers.our_collate_fn, num_workers = 4, shuffle=False, pin_memory = True, prefetch_factor=4,persistent_workers=True)
     
     # Pre-select samples for qualitative visualization
-    qualitative_indices = select_qualitative_samples(val_dataset, num_takes=2, frames_per_take=4)
-    print(f"Pre-selected {len(qualitative_indices)} samples for qualitative visualization")
+    qualitative_selections = select_qualitative_samples(val_dataset, num_takes=2, frames_per_take=4)
+    print(f"Pre-selected {len(qualitative_selections)} takes for qualitative visualization")
 
     descriptor_extractor = DescriptorExtractor('dinov2_vitb14_reg', args.patch_size, args.context_size, device)
     model = Attention_projector(reverse = args.reverse).to(device)
@@ -352,7 +304,6 @@ if __name__ == "__main__":
     optimizer = torch.optim.AdamW(model.parameters(), lr=8e-5)
     T_max = args.max_iterations
     scheduler = CosineAnnealingLR(optimizer, args.max_iterations, eta_min=1e-6)
-    # scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3, verbose=True)
 
     # Create experiment folders
     exp_dir = Path("exp_results", exp_name)
@@ -371,34 +322,34 @@ if __name__ == "__main__":
     
     # Training loop
     while global_step < args.max_iterations:
-        model.train()
-        batch = next(train_iter)
+        # model.train()
+        # batch = next(train_iter)
         
-        DEST_descriptors, DEST_img_feats = descriptor_extractor.get_DEST_descriptors(batch)
-        SOURCE_descriptors, SOURCE_img_feats = descriptor_extractor.get_SOURCE_descriptors(batch)
-        best_similarities, best_masks, refined_mask, loss, top5_masks = model(SOURCE_descriptors, DEST_descriptors, 
-                                                                              SOURCE_img_feats, DEST_img_feats, 
-                                                                              batch['POS_mask_position'], batch['is_visible'],
-                                                                              batch['DEST_SAM_masks'], test_mode = False)
-        loss.backward()
+        # DEST_descriptors, DEST_img_feats = descriptor_extractor.get_DEST_descriptors(batch)
+        # SOURCE_descriptors, SOURCE_img_feats = descriptor_extractor.get_SOURCE_descriptors(batch)
+        # best_similarities, best_masks, refined_mask, loss, top5_masks = model(SOURCE_descriptors, DEST_descriptors, 
+        #                                                                       SOURCE_img_feats, DEST_img_feats, 
+        #                                                                       batch['POS_mask_position'], batch['is_visible'],
+        #                                                                       batch['DEST_SAM_masks'], test_mode = False)
+        # loss.backward()
         
-        optimizer.step()
-        scheduler.step()  # ReduceLROnPlateau uses validation IoU, not step count
-        optimizer.zero_grad()
+        # optimizer.step()
+        # scheduler.step()
+        # optimizer.zero_grad()
         
         global_step += 1
         current_epoch = global_step / trainset_length
         
-        # Log training metrics to WandB
-        wandb.log({
-            "train/loss": loss.item(), 
-            "train/epoch": current_epoch, 
-            "train/step": global_step
-        })
+        # # Log training metrics to WandB
+        # wandb.log({
+        #     "train/loss": loss.item(), 
+        #     "train/epoch": current_epoch, 
+        #     "train/step": global_step
+        # })
         
-        # Print progress every 100 steps
-        if global_step % 100 == 0:
-            print(f'Step {global_step}/{args.max_iterations} (Epoch {current_epoch:.2f}), Loss: {loss.item():.4f}')
+        # # Print progress every 100 steps
+        # if global_step % 100 == 0:
+        #     print(f'Step {global_step}/{args.max_iterations} (Epoch {current_epoch:.2f}), Loss: {loss.item():.4f}')
         
         # Validation every eval_step
         if global_step % eval_step == 0 or global_step == 1:
@@ -408,10 +359,7 @@ if __name__ == "__main__":
             # Run validation
             best_IoU = run_validation(model, descriptor_extractor, val_dataloader, val_dataset,
                                      args, qualitative_dir, exp_dir, exp_name, current_epoch,
-                                     global_step, best_IoU, DEBUG_MODE, qualitative_indices)
-            
-            # Update learning rate based on validation IoU
-            # scheduler.step(best_IoU)
+                                     global_step, best_IoU, DEBUG_MODE, qualitative_selections)
         
         # Debug mode: limit training iterations
         if DEBUG_MODE and global_step >= 2:

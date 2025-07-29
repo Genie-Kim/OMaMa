@@ -37,13 +37,7 @@ def convert_ndarray(obj):
 
 
 """
-python main_qual.py \                                   
-    --reverse \                                         
-    --root Ego-Exo4d \                                  
-    --devices 0 \                                       
-    --checkpoint_dir pretrained_models/Exo2Ego.pt \            
-    --exp_name Eval_OMAMA_0fe5b647 \                    
-    --data_id "0fe5b647-cdd0-43e9-8710-b33a2e0f83ef"
+python main_qual.py --reverse --root Ego-Exo4d --devices 0 --checkpoint_dir pretrained_models/Exo2Ego.pt --exp_name Eval_OMAMA_0fe5b647 --data_id "1f541cce-f10b-4cd3-814f-8e2d527df8f5"
 """
 
 
@@ -88,7 +82,7 @@ if __name__ == "__main__":
         # Quick loading and direct access
         test_dataset = Masks_Dataset(args.root, args.patch_size, args.reverse, 
                                  train=False, N_masks_per_batch=args.N_masks_per_batch, 
-                                 order=args.order, test=False)
+                                 order=args.order, test=True)
         
         # Print some info to debug
         print(f"Dataset size: {len(test_dataset.pairs)}")

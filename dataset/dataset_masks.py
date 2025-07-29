@@ -112,7 +112,14 @@ class Masks_Dataset(Dataset):
         d = self.dataset_dir
         with open(f'{d}/split.json', 'r') as fp:
             splits = json.load(fp)
-        valid_takes = splits['train'] + splits['val'] + splits['test']
+        
+        # Only load annotations for the current mode to save memory
+        if self.train_mode:
+            valid_takes = splits['train']
+        elif self.val_mode:
+            valid_takes = splits['val']
+        else:  # test_mode
+            valid_takes = splits['test']
 
         annotations = {}
         for take in valid_takes:
@@ -248,8 +255,11 @@ class Masks_Dataset(Dataset):
         if H_masks != self.h2 or W_masks != self.w2: # Only in inference for FastSAM masks
             SAM_masks = F.interpolate(SAM_masks.unsqueeze(0).float(), size=(self.h2, self.w2), mode='nearest').squeeze(0).long()
         
-        # Get the adjacent matrix
-        adj_matrix = get_adj_matrix(SAM_masks, order=self.order)
+        # Get the adjacent matrix (only needed for training)
+        if self.train_mode:
+            adj_matrix = get_adj_matrix(SAM_masks, order=self.order)
+        else:
+            adj_matrix = None
         
         SAM_bboxes_dest = np.load(f"{self.masks_dir}/{take_id2}/{cam2}/{vid_idx2}_boxes.npy")
         SAM_bboxes_dest = torch.from_numpy(SAM_bboxes_dest.astype(np.float32)) # x1, y1, w, h
