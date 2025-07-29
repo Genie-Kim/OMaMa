@@ -288,13 +288,14 @@ if __name__ == "__main__":
     
     # Training dataset only contains horizontal images, in order to batchify the masks
     train_dataset = Masks_Dataset(args.root, args.patch_size, args.reverse, N_masks_per_batch=args.N_masks_per_batch, order = args.order, train = True)
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=helpers.our_collate_fn, num_workers = 8, pin_memory = False, prefetch_factor=2)
+    # train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=helpers.our_collate_fn, num_workers = 8, pin_memory = False, prefetch_factor=2)
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers = 8, pin_memory = False, prefetch_factor=2)
     
     # Validation dataset contains both horizontal and vertical images. Now supports batch processing for efficiency
     # Note: the val annotations are a small subset of the full validation dataset, used for eval the training per epoch
     val_dataset = Masks_Dataset(args.root, args.patch_size, args.reverse, N_masks_per_batch = 48,  order = args.order, val = True)
     # val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=helpers.our_collate_fn, num_workers = 8, shuffle=False, pin_memory = False, prefetch_factor=2)
-    val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=None, num_workers = 8, shuffle=False, pin_memory = False, prefetch_factor=2)
+    val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, num_workers = 8, shuffle=False, pin_memory = False, prefetch_factor=2)
     
     # Pre-select samples for qualitative visualization
     qualitative_selections = select_qualitative_samples(val_dataset, num_takes=2, frames_per_take=4)
@@ -325,41 +326,41 @@ if __name__ == "__main__":
 
     # Training loop
     while global_step < args.max_iterations:
-        # model.train()
-        # try:
-        #     batch = next(train_iter)      # 다음 배치
-        # except StopIteration:             # epoch 끝 → 새 iterator
-        #     train_iter = iter(train_dataloader)
-        #     batch = next(train_iter)
+        model.train()
+        try:
+            batch = next(train_iter)      # 다음 배치
+        except StopIteration:             # epoch 끝 → 새 iterator
+            train_iter = iter(train_dataloader)
+            batch = next(train_iter)
         
-        # DEST_descriptors, DEST_img_feats = descriptor_extractor.get_DEST_descriptors(batch)
-        # SOURCE_descriptors, SOURCE_img_feats = descriptor_extractor.get_SOURCE_descriptors(batch)
-        # best_similarities, best_masks, refined_mask, loss, top5_masks = model(SOURCE_descriptors, DEST_descriptors, 
-        #                                                                       SOURCE_img_feats, DEST_img_feats, 
-        #                                                                       batch['POS_mask_position'], batch['is_visible'],
-        #                                                                       batch['DEST_SAM_masks'], test_mode = False)
-        # loss.backward()
+        DEST_descriptors, DEST_img_feats = descriptor_extractor.get_DEST_descriptors(batch)
+        SOURCE_descriptors, SOURCE_img_feats = descriptor_extractor.get_SOURCE_descriptors(batch)
+        best_similarities, best_masks, refined_mask, loss, top5_masks = model(SOURCE_descriptors, DEST_descriptors, 
+                                                                              SOURCE_img_feats, DEST_img_feats, 
+                                                                              batch['POS_mask_position'], batch['is_visible'],
+                                                                              batch['DEST_SAM_masks'], test_mode = False)
+        loss.backward()
         
-        # optimizer.step()
-        # scheduler.step()
-        # optimizer.zero_grad()
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
         
         global_step += 1
         current_epoch = global_step / trainset_length
         
-        # # Log training metrics to WandB
-        # wandb.log({
-        #     "train/loss": loss.item(), 
-        #     "train/epoch": current_epoch, 
-        #     "train/step": global_step
-        # })
+        # Log training metrics to WandB
+        wandb.log({
+            "train/loss": loss.item(), 
+            "train/epoch": current_epoch, 
+            "train/step": global_step
+        })
         
-        # # Print progress every 100 steps
-        # if global_step % 100 == 0:
-        #     print(f'Step {global_step}/{args.max_iterations} (Epoch {current_epoch:.2f}), Loss: {loss.item():.4f}')
-        
+        # Print progress every 100 steps
+        if global_step % 100 == 0:
+            print(f'Step {global_step}/{args.max_iterations} (Epoch {current_epoch:.2f}), Loss: {loss.item():.4f}')
+
         # Validation every eval_step
-        if global_step % eval_step == 0 or global_step == 1:
+        if global_step % eval_step == 0:
             # Save checkpoint before validation
             torch.save(model.state_dict(), exp_dir / f'step_{global_step}_epoch_{current_epoch:.2f}_{exp_name}.pt')
             
