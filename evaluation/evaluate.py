@@ -2,19 +2,15 @@ import numpy as np
 from pycocotools import mask as mask_utils
 
 
-def add_to_json(dataset, idx_dataset, 
+def add_to_json(img_pth1, img_pth2, gt_mask, reverse,
                 pred_mask2, confidence,
                 processed, pred_json, gt_json):
     
-    mask_annotations = dataset.mask_annotations
-    reverse = dataset.reverse
     if reverse:
         # img_pth2 ego, img_pth1 exo
         setting = "exo-ego"
-        img_pth2, _, img_pth1, _ = dataset.pairs[idx_dataset]
     else:
         setting = "ego-exo"
-        img_pth1, _, img_pth2, _ = dataset.pairs[idx_dataset]
 
     _, take_id, cam, obj, _, idx = img_pth1.split('//')
     _, _, cam2, obj2, _, _ = img_pth2.split('//')
@@ -41,10 +37,14 @@ def add_to_json(dataset, idx_dataset,
     if idx not in pred_json[take_id]['subsample_idx']:
         pred_json[take_id]['subsample_idx'].append(idx)
     if idx not in gt_json[take_id]['masks'][obj][cam].keys():
-        gt_json[take_id]['masks'][obj][cam][idx] = mask_annotations[take_id]['masks'][obj][cam][idx]
+        # Encode GT mask for source camera
+        gt_mask_encoded = mask_utils.encode(np.asfortranarray(gt_mask.astype(np.uint8)))
+        gt_mask_encoded['counts'] = gt_mask_encoded['counts'].decode('ascii')
+        gt_json[take_id]['masks'][obj][cam][idx] = gt_mask_encoded
         gt_json[take_id]['annotated_frames'][obj][cam].append(int(idx))
-        if idx in mask_annotations[take_id]['masks'][obj2][cam2]: 
-            gt_json[take_id]['masks'][obj][cam2][idx] = mask_annotations[take_id]['masks'][obj][cam2][idx]
+        # If object is visible in destination, add to cam2 as well
+        if gt_mask.sum() > 0:  # visible
+            gt_json[take_id]['masks'][obj][cam2][idx] = gt_mask_encoded
         gt_json[take_id]['annotated_frames'][obj][cam2].append(int(idx))
 
     pred2 = mask_utils.encode(np.asfortranarray(pred_mask2.astype(np.uint8)))

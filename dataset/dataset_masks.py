@@ -1,23 +1,22 @@
 """ Dataloader for the Ego-Exo4D correspondences dataset """
 
-import os 
-import torch
+# Standard library imports
 import json
-import cv2
-import numpy as np
-from pycocotools import mask as mask_utils
-import torch.nn.functional as F
-import torchvision.transforms as transforms
-
-import torch
-from torch.utils.data import Dataset
+import os
 import random
 
+# Third-party imports
 import cv2
-import torch
-import numpy as np
+import gc
 import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torchvision.transforms as transforms
+from pycocotools import mask as mask_utils
+from torch.utils.data import Dataset
 
+# Local imports
 from dataset.adj_descriptors import get_adj_matrix
 from dataset.dataset_utils import compute_IoU, compute_IoU_bbox, bbox_from_mask
 
@@ -62,7 +61,7 @@ class Masks_Dataset(Dataset):
         self.order = order
 
         # Load the mask annotations and pairs
-        self.mask_annotations = self.load_mask_annotations()
+        self.mask_annotations_paths = self.load_mask_annotations_path()
         self.pairs = self.load_all_pairs()
         self.takes_json = json.load(open(os.path.join(root, 'takes.json'), 'r'))
 
@@ -108,7 +107,7 @@ class Masks_Dataset(Dataset):
         return pairs
     
     # Load the GT mask annotations
-    def load_mask_annotations(self):
+    def load_mask_annotations_path(self):
         d = self.dataset_dir
         with open(f'{d}/split.json', 'r') as fp:
             splits = json.load(fp)
@@ -125,9 +124,15 @@ class Masks_Dataset(Dataset):
         for take in valid_takes:
             try:
                 with open(f'{d}/{take}/annotation.json', 'r') as fp:
-                    annotations[take] = json.load(fp)
+                    # annotations[take] = json.load(fp)
+                    annotations[take] = f'{d}/{take}/annotation.json'
             except:
                 continue
+        return annotations
+    
+    def load_mask_annotations(self, take_id):
+        with open(self.mask_annotations_paths[take_id], 'r') as fp:
+            annotations = json.load(fp)
         return annotations
 
     # Returns the img reshaped slightly to be divisible by 14 (dinov2 patch size)
@@ -220,7 +225,7 @@ class Masks_Dataset(Dataset):
         img1_torch = self.transform_img(img1)
 
         # Load the source mask
-        mask_annotation_SOURCE = self.mask_annotations[take_id]
+        mask_annotation_SOURCE = self.load_mask_annotations(take_id)
         mask_SOURCE = mask_utils.decode(mask_annotation_SOURCE['masks'][obj][cam][idx])
         mask_SOURCE = cv2.resize(mask_SOURCE, (img1.shape[1],img1.shape[0]), interpolation=cv2.INTER_NEAREST)
         assert mask_SOURCE.shape == img1.shape[:2]
@@ -237,7 +242,7 @@ class Masks_Dataset(Dataset):
 
                 
         # Load the destination GT mask
-        mask_annotation_DEST = self.mask_annotations[take_id2]
+        mask_annotation_DEST = self.load_mask_annotations(take_id2)
         if idx in mask_annotation_DEST['masks'][obj2][cam2]:  # If the object is visible in the destionation image, load it
             mask2_GT = mask_utils.decode(mask_annotation_DEST['masks'][obj2][cam2][idx])
             mask2_GT = cv2.resize(mask2_GT, (img2.shape[1],img2.shape[0]), interpolation=cv2.INTER_NEAREST)
@@ -253,7 +258,7 @@ class Masks_Dataset(Dataset):
             SAM_masks = torch.zeros((1, self.h2, self.w2))
         N_masks, H_masks, W_masks = SAM_masks.shape
         if H_masks != self.h2 or W_masks != self.w2: # Only in inference for FastSAM masks
-            SAM_masks = F.interpolate(SAM_masks.unsqueeze(0).float(), size=(self.h2, self.w2), mode='nearest').squeeze(0).long()
+            SAM_masks = F.interpolate(SAM_masks.unsqueeze(0).float(), size=(self.h2, self.w2), mode='nearest').squeeze(0).to(torch.uint8)
         
         # Get the adjacent matrix (only needed for training)
         if self.train_mode:
@@ -271,60 +276,70 @@ class Masks_Dataset(Dataset):
             SAM_bboxes_dest[:, 2] = SAM_bboxes_dest[:, 2] * w_factor
             SAM_bboxes_dest[:, 3] = SAM_bboxes_dest[:, 3] * h_factor       
 
-        if self.train_mode:
-            visible_pixels = mask2_GT.sum()
+        if self.train_mode:  # Training: Construct 1 positive + 31 negative batch for contrastive learning
+            visible_pixels = mask2_GT.sum()  # Check if object is visible in destination image
             # If the object is visible in the destination image, we select the best SAM mask as the positive mask
-            if visible_pixels > 0:
-                NEG_SAM_masks, NEG_SAM_bboxes = self.select_adjacent_negatives(adj_matrix, SAM_bboxes_dest, SAM_masks, mask2_GT)
+            if visible_pixels > 0:  # Case 1: Object is visible - use GT as strong positive
+                NEG_SAM_masks, NEG_SAM_bboxes = self.select_adjacent_negatives(adj_matrix, SAM_bboxes_dest, SAM_masks, mask2_GT)  # Hard negative mining using adjacency
                 is_visible = torch.tensor(1.) # True
                 POS_SAM_masks = mask2_GT # Choose the GT (Strong Positive) or the best SAM mask (Weak Positive) TODO
                 POS_SAM_bboxes, _ = bbox_from_mask(mask2_GT) # x1, y1, w, h
-            else:
-                N_remaining_indices = self.N_masks_per_batch - 1
-                if SAM_masks.shape[0] < N_remaining_indices:
+            else:  # Case 2: Object not visible - random selection for negative learning
+                N_remaining_indices = self.N_masks_per_batch - 1  # Need 31 negatives
+                if SAM_masks.shape[0] < N_remaining_indices:  # If not enough masks, use replacement
                     random_indices = np.random.choice(SAM_masks.shape[0], N_remaining_indices, replace=True)
-                else:
+                else:  # Sufficient masks, no replacement needed
                     random_indices = np.random.choice(SAM_masks.shape[0], N_remaining_indices, replace=False)
                 
-                NEG_SAM_masks = SAM_masks[random_indices]
+                NEG_SAM_masks = SAM_masks[random_indices]  # Random negatives
                 NEG_SAM_bboxes = SAM_bboxes_dest[random_indices]
                 is_visible = torch.tensor(0.) #False
-                random_idx = np.random.randint(SAM_masks.shape[0])
+                random_idx = np.random.randint(SAM_masks.shape[0])  # Pick random mask as fake positive
                 POS_SAM_masks = SAM_masks[random_idx]
                 POS_SAM_bboxes = SAM_bboxes_dest[random_idx]
 
-            POS_mask_position = random.randint(0, self.N_masks_per_batch - 1) # Random position of the positive mask in the batch
-            NEG_part1 = NEG_SAM_masks[:POS_mask_position]
-            NEG_part2 = NEG_SAM_masks[POS_mask_position:]
-            DEST_SAM_masks = torch.cat((NEG_part1, POS_SAM_masks.unsqueeze(0), NEG_part2), dim=0)
+            POS_mask_position = random.randint(0, self.N_masks_per_batch - 1) # Random position of the positive mask in the batch (prevent position bias)
+            NEG_part1 = NEG_SAM_masks[:POS_mask_position]  # Split negatives: before positive
+            NEG_part2 = NEG_SAM_masks[POS_mask_position:]  # Split negatives: after positive
+            DEST_SAM_masks = torch.cat((NEG_part1, POS_SAM_masks.unsqueeze(0), NEG_part2), dim=0)  # Final batch: [neg...pos...neg]
 
-            NEG_part1_bboxes = NEG_SAM_bboxes[:POS_mask_position]
+            NEG_part1_bboxes = NEG_SAM_bboxes[:POS_mask_position]  # Corresponding bbox splits
             NEG_part2_bboxes = NEG_SAM_bboxes[POS_mask_position:]
-            DEST_SAM_bboxes = torch.cat((NEG_part1_bboxes, POS_SAM_bboxes.unsqueeze(0), NEG_part2_bboxes), dim=0)
+            DEST_SAM_bboxes = torch.cat((NEG_part1_bboxes, POS_SAM_bboxes.unsqueeze(0), NEG_part2_bboxes), dim=0)  # Final bbox batch
 
         # In validation or test modes, we just return the SAM masks, and precompute which is the best SAM mask
         elif self.val_mode:
-            # Randomly sample N_masks_per_batch masks for validation batch processing
-            if SAM_masks.shape[0] >= self.N_masks_per_batch:
-                random_indices = np.random.choice(SAM_masks.shape[0], self.N_masks_per_batch, replace=False)
-            else:
-                random_indices = np.random.choice(SAM_masks.shape[0], self.N_masks_per_batch, replace=True)
+            # First check visibility and find best mask before sampling
+            visible_pixels = mask2_GT.sum()
+            if visible_pixels > 0:  # Object is visible - ensure best mask is included
+                is_visible = torch.tensor(1.) # True
+                best_original = self.get_best_mask(SAM_masks, mask2_GT)
+                
+                # Sample remaining masks (N_masks_per_batch - 1) excluding best_original
+                remaining_indices = np.setdiff1d(np.arange(SAM_masks.shape[0]), [best_original])
+                N_remaining = self.N_masks_per_batch - 1
+                
+                if len(remaining_indices) >= N_remaining:
+                    sampled_remaining = np.random.choice(remaining_indices, N_remaining, replace=False)
+                else:
+                    sampled_remaining = np.random.choice(remaining_indices, N_remaining, replace=True)
+                
+                # Insert best mask at random position
+                POS_mask_position = random.randint(0, self.N_masks_per_batch - 1)
+                indices_part1 = sampled_remaining[:POS_mask_position]
+                indices_part2 = sampled_remaining[POS_mask_position:]
+                random_indices = np.concatenate([indices_part1, [best_original], indices_part2])
+                
+            else:  # Object not visible - random sampling
+                is_visible = torch.tensor(0.) # False
+                POS_mask_position = 0
+                if SAM_masks.shape[0] >= self.N_masks_per_batch:
+                    random_indices = np.random.choice(SAM_masks.shape[0], self.N_masks_per_batch, replace=False)
+                else:
+                    random_indices = np.random.choice(SAM_masks.shape[0], self.N_masks_per_batch, replace=True)
             
             DEST_SAM_masks = SAM_masks[random_indices]
             DEST_SAM_bboxes = SAM_bboxes_dest[random_indices]
-            
-            visible_pixels = mask2_GT.sum()
-            if visible_pixels > 0:
-                is_visible = torch.tensor(1.) # True
-                best_original = self.get_best_mask(SAM_masks, mask2_GT)
-                # Find position in sampled masks or default to 0
-                if best_original in random_indices:
-                    POS_mask_position = np.where(random_indices == best_original)[0][0]
-                else:
-                    POS_mask_position = 0
-            else:
-                is_visible = torch.tensor(0.) # False
-                POS_mask_position = 0
                 
         else:
             DEST_SAM_masks = SAM_masks
@@ -338,11 +353,99 @@ class Masks_Dataset(Dataset):
             if len(DEST_SAM_bboxes.shape) == 1:
                 DEST_SAM_bboxes = torch.zeros((1, 4))
         
+        # # Memory usage analysis of __getitem__ variables
+        # locals_dict = locals()
+        # print(f"\n=== __getitem__ Variables Memory Analysis (idx={idx_sample}) ===")
+        # total_size = 0
+        
+        # # Key variables to check
+        # key_vars = ['img1', 'img2', 'img1_torch', 'img2_torch', 
+        #             'mask_SOURCE', 'mask2_GT', 'SAM_masks', 'SAM_bboxes_dest',
+        #             'DEST_SAM_masks', 'DEST_SAM_bboxes', 'adj_matrix',
+        #             'mask_annotation_SOURCE', 'mask_annotation_DEST']
+        
+        # for var_name in key_vars:
+        #     if var_name in locals_dict:
+        #         var_value = locals_dict[var_name]
+        #         size = check_size(var_value, var_name)
+        #         total_size += size
+        
+        # print(f"Total __getitem__ variables: {total_size / 1024 / 1024:.2f} MB")
+        # print("-" * 60)
+
+        # Memory cleanup: Remove large unnecessary variables before return
+        
+        # Original images (largest memory usage ~1.4MB each)
+        del img1, img2
+        # Annotation dictionaries (large JSON data)
+        del mask_annotation_SOURCE, mask_annotation_DEST
+        
+        # Force garbage collection to actually free memory
+        gc.collect()
+
         return {'SOURCE_img': img1_torch, 'SOURCE_mask': mask_SOURCE, 'SOURCE_bbox': bbox_from_mask(mask_SOURCE)[0], 'SOURCE_img_size': torch.tensor([self.h1, self.w1]),
                 'GT_img': img2_torch, 'GT_mask': mask2_GT, 
                 'DEST_SAM_masks': DEST_SAM_masks, 'DEST_SAM_bbox': DEST_SAM_bboxes, 'DEST_img_size': torch.tensor([self.h2, self.w2]),
                 'is_visible': is_visible, 'POS_mask_position': torch.tensor(POS_mask_position),
-                'pair_idx': torch.tensor(idx_sample)}
+                'pair_idx': torch.tensor(idx_sample),
+                'img_pth1': img_pth1, 'img_pth2': img_pth2}
+
+
+def check_size(var, varname):
+    import sys
+    size_bytes = sys.getsizeof(var)
+    size_mb = size_bytes / 1024 / 1024
+    # print(f"{varname} The size : {size_mb:.2f} MB")
+    return size_bytes
+
+
+if __name__ == "__main__":
+    import sys, os
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import helpers
+    from torch.utils.data import DataLoader
+    
+    print("Testing Masks_Dataset iteration...")
+    
+    # Test parameters
+    root = "Ego-Exo4d"  # Update this path to your actual dataset
+    mode = "train"  # Options: "train", "val", "test"
+    
+    # Test single sample
+    try:
+        # Test different modes - change this to test different dataset modes
+        
+        if mode == "train":
+            dataset = Masks_Dataset(root, patch_size=14, reverse=False, N_masks_per_batch=32, order=2, train=True)
+        elif mode == "val":
+            dataset = Masks_Dataset(root, patch_size=14, reverse=False, N_masks_per_batch=32, order=2, val=True)
+        elif mode == "test":
+            dataset = Masks_Dataset(root, patch_size=14, reverse=False, N_masks_per_batch=32, order=2, test=True)
+        
+        print(f"{mode.capitalize()} dataset created with {len(dataset)} samples")
+        
+        sample = dataset[0]
+        print(f"Sample keys: {list(sample.keys())}")
+        print(f"Shapes - SOURCE: {sample['SOURCE_img'].shape}, GT: {sample['GT_img'].shape}, MASKS: {sample['DEST_SAM_masks'].shape}")
+        print(f"is_visible: {sample['is_visible']}, POS_mask_position: {sample['POS_mask_position']}")
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        exit()
+    
+    # Test DataLoader
+    try:
+        dataloader = DataLoader(dataset, batch_size=24, collate_fn=helpers.our_collate_fn, num_workers=0, pin_memory=True)
+        batch = next(iter(dataloader))
+        
+        print(f"\nBatch test successful!")
+        print(f"Batch shapes - SOURCE: {batch['SOURCE_img'].shape}, GT: {batch['GT_img'].shape}")
+        print(f"DEST_SAM_masks: {batch['DEST_SAM_masks'].shape}")
+        
+    except Exception as e:
+        print(f"DataLoader error: {e}")
+    
+    print("Test completed!")
 
 
 

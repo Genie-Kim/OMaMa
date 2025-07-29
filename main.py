@@ -94,9 +94,11 @@ def run_validation(model, descriptor_extractor, val_dataloader, val_dataset,
                 # Add to evaluation JSON
                 sample_pair_idx = batch['pair_idx'][b].item()
                 sample_confidence = confidence[b] if len(confidence.shape) > 0 else confidence
-                pred_json_epoch, gt_json_epoch = add_to_json(val_dataset, sample_pair_idx, 
-                                                            pred_mask, sample_confidence,
-                                                            processed_epoch, pred_json_epoch, gt_json_epoch)
+                pred_json_epoch, gt_json_epoch = add_to_json(
+                    batch['img_pth1'][b], batch['img_pth2'][b], 
+                    batch['GT_mask'][b].detach().cpu().numpy(), args.reverse,
+                    pred_mask, sample_confidence,
+                    processed_epoch, pred_json_epoch, gt_json_epoch)
                 
                 # Generate qualitative outputs for pre-selected samples
                 # Extract take_id, camera_name, object_name, and frame_idx from the image path
@@ -286,12 +288,13 @@ if __name__ == "__main__":
     
     # Training dataset only contains horizontal images, in order to batchify the masks
     train_dataset = Masks_Dataset(args.root, args.patch_size, args.reverse, N_masks_per_batch=args.N_masks_per_batch, order = args.order, train = True)
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=helpers.our_collate_fn, num_workers = 4, pin_memory = True, prefetch_factor=4,persistent_workers=True) #16 in both
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=helpers.our_collate_fn, num_workers = 8, pin_memory = False, prefetch_factor=2)
     
     # Validation dataset contains both horizontal and vertical images. Now supports batch processing for efficiency
     # Note: the val annotations are a small subset of the full validation dataset, used for eval the training per epoch
     val_dataset = Masks_Dataset(args.root, args.patch_size, args.reverse, N_masks_per_batch = 48,  order = args.order, val = True)
-    val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=helpers.our_collate_fn, num_workers = 4, shuffle=False, pin_memory = True, prefetch_factor=4,persistent_workers=True)
+    # val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=helpers.our_collate_fn, num_workers = 8, shuffle=False, pin_memory = False, prefetch_factor=2)
+    val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=None, num_workers = 8, shuffle=False, pin_memory = False, prefetch_factor=2)
     
     # Pre-select samples for qualitative visualization
     qualitative_selections = select_qualitative_samples(val_dataset, num_takes=2, frames_per_take=4)
@@ -315,15 +318,19 @@ if __name__ == "__main__":
     global_step = 0
     eval_step = 2000
     best_IoU = 0
-    train_iter = itertools.cycle(train_dataloader)
+    train_iter = iter(train_dataloader) 
     trainset_length = len(train_dataloader)
     
     print(f'Starting training for {args.max_iterations} iterations, validating every {eval_step} steps')
-    
+
     # Training loop
     while global_step < args.max_iterations:
         # model.train()
-        # batch = next(train_iter)
+        # try:
+        #     batch = next(train_iter)      # 다음 배치
+        # except StopIteration:             # epoch 끝 → 새 iterator
+        #     train_iter = iter(train_dataloader)
+        #     batch = next(train_iter)
         
         # DEST_descriptors, DEST_img_feats = descriptor_extractor.get_DEST_descriptors(batch)
         # SOURCE_descriptors, SOURCE_img_feats = descriptor_extractor.get_SOURCE_descriptors(batch)
