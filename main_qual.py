@@ -168,6 +168,8 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_dir", type=str, default="pretrained_models/Exo2Ego.pt")
     parser.add_argument("--data_id", type=str, help="Specific data ID for qualitative analysis (optional)")
     parser.add_argument("--top5qual", type=bool,default=True, help="plot top 5 qualitative results")
+    parser.add_argument("--qual_dir", type=str,default=None, help="path to qualitative")
+
     args = parser.parse_args()
 
     helpers.set_all_seeds(42)
@@ -183,7 +185,10 @@ if __name__ == "__main__":
     # Create qualitative folder
     # qualitative_dir = Path('qualitative_results')
     qualitative_dir = Path(os.path.join(os.path.dirname(args.checkpoint_dir), 'qualitative_results'))
-    qualitative_dir.mkdir(parents=True, exist_ok=True)
+    if args.qual_dir is not None:
+        qualitative_dir = Path(args.qual_dir)/qualitative_dir
+    else:
+        qualitative_dir.mkdir(parents=True, exist_ok=True)
     
     # Load model
     descriptor_extractor = DescriptorExtractor('dinov2_vitb14_reg',  args.patch_size, args.context_size, device)
@@ -199,7 +204,6 @@ if __name__ == "__main__":
     
     # Only load dataset if specific data_id provided or for batch processing
     if args.data_id:
-        test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=8, pin_memory=True, prefetch_factor=8)
         print(f"Looking for specific data_id: {args.data_id}")
         # Print some info to debug
         print(f"Dataset size: {len(test_dataset.pairs)}")
@@ -287,6 +291,7 @@ if __name__ == "__main__":
 
         print(f"Processing all test samples for qualitative visualization...")
         print(f"Total samples to process: {len(test_dataset)}")
+        test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=8, pin_memory=True, prefetch_factor=8)
         
         for batch_idx, batch in enumerate(tqdm(test_dataloader, desc="Processing samples")):
             # Extract path information to get take_id and frame_idx
