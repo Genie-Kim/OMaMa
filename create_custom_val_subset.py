@@ -47,18 +47,37 @@ def main(input_file_name, output_file_name):
     unique_pairs = list(grouped_pairs.keys())
     print(f"Unique (take_id, ego_camera, exo_camera, object_name) combinations: {len(unique_pairs)}")
     
-    # Randomly select 10% of unique pairs
-    num_to_select = max(1, int(len(unique_pairs) * 0.1))
+    # Randomly select 40% of unique pairs
+    num_to_select = max(1, int(len(unique_pairs) * 0.4))
     selected_pairs = random.sample(unique_pairs, num_to_select)
     
-    print(f"Selected {num_to_select} unique combinations (10%)")
+    print(f"Selected {num_to_select} unique combinations (40%)")
     
-    # Collect all pairs belonging to selected combinations
+    # Collect pairs with 1/16 reduction using random start + consecutive window
     selected_data = []
+    skipped_groups = 0
+    
     for key in selected_pairs:
-        selected_data.extend(grouped_pairs[key])
+        # Sort frames by frame number
+        all_frames = sorted(grouped_pairs[key], key=lambda x: int(x[0].split('//')[-1]))
+        total_frames = len(all_frames)
+        window_size = total_frames // 16
+        
+        # Skip if window size is less than 5
+        if window_size < 5:
+            skipped_groups += 1
+            continue
+            
+        # Random start within first 16 frames (or less if total frames < 16)
+        max_start = min(16, total_frames - window_size)
+        start_idx = random.randint(0, max_start - 1) if max_start > 1 else 0
+        
+        # Select consecutive window
+        selected_frames = all_frames[start_idx:start_idx + window_size]
+        selected_data.extend(selected_frames)
     
     print(f"Total pairs in selected subset: {len(selected_data)}")
+    print(f"Skipped {skipped_groups} groups with less than 5 frames after 1/16 reduction")
     
     # Save to output file
     with open(output_file, 'w') as f:
@@ -68,32 +87,38 @@ def main(input_file_name, output_file_name):
     
     # Print detailed statistics
     print("\nSelected combinations with frame details:")
+    actual_groups = 0
     for i, key in enumerate(selected_pairs[:10]):
         take_id, ego_cam, exo_cam, object_name = key
-        pairs = grouped_pairs[key]
+        all_frames = sorted(grouped_pairs[key], key=lambda x: int(x[0].split('//')[-1]))
+        total_frames = len(all_frames)
+        window_size = total_frames // 16
         
-        # Extract frame numbers from the paths
-        frames = []
-        for pair in pairs[:10]:  # Show first 10 frames
-            frame_num = pair[0].split('//')[-1]  # Get frame number from path
-            frames.append(frame_num)
+        if window_size < 5:
+            continue
+            
+        actual_groups += 1
         
-        print(f"  {i+1}. Take: {take_id[:8]}..., Ego: {ego_cam}, Exo: {exo_cam}, Object: {object_name}")
-        print(f"      Total frames: {len(pairs)}")
-        print(f"      Sample frames: {', '.join(frames[:5])}", end="")
-        if len(frames) > 5:
-            print(f", ... ({len(pairs) - 5} more frames)")
-        else:
-            print()
-    
-    if len(selected_pairs) > 5:
-        print(f"  ... and {len(selected_pairs) - 5} more combinations")
+        # Find the actual selected frames for this group
+        max_start = min(16, total_frames - window_size)
+        # Note: we can't know exact start_idx here as it was random, but we can show the window size
+        
+        print(f"  {actual_groups}. Take: {take_id[:8]}..., Ego: {ego_cam}, Exo: {exo_cam}, Object: {object_name}")
+        print(f"      Original frames: {total_frames}, Window size: {window_size} (1/16 reduction)")
+        print(f"      Frame range: {all_frames[0][0].split('//')[-1]} - {all_frames[-1][0].split('//')[-1]}")
+        
+    if len(selected_pairs) - skipped_groups > 10:
+        print(f"  ... and {len(selected_pairs) - skipped_groups - 10} more combinations")
     
     # Overall statistics
+    actual_combinations = len(selected_pairs) - skipped_groups
     print(f"\nOverall statistics:")
     print(f"  Total unique combinations selected: {len(selected_pairs)}")
+    print(f"  Combinations after filtering (≥5 frames): {actual_combinations}")
     print(f"  Total frame pairs in subset: {len(selected_data)}")
-    print(f"  Average frames per combination: {len(selected_data) / len(selected_pairs):.1f}")
+    if actual_combinations > 0:
+        print(f"  Average frames per combination: {len(selected_data) / actual_combinations:.1f}")
+    print(f"  Data reduction: {len(selected_data)} frames from original dataset")
 
 if __name__ == "__main__":
     random.seed(42)  # For reproducibility
