@@ -351,13 +351,13 @@ if __name__ == "__main__":
     # Training dataset only contains horizontal images, in order to batchify the masks
     train_dataset = Masks_Dataset(args.root, args.patch_size, args.reverse, N_masks_per_batch=args.N_masks_per_batch, order = args.order, train = True)
     # train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=helpers.our_collate_fn, num_workers = 8, pin_memory = False, prefetch_factor=2)
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers = 12, pin_memory = False, prefetch_factor=2)
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers = 16, prefetch_factor=2)
     
     # Validation dataset contains both horizontal and vertical images. Now supports batch processing for efficiency
     # Note: the val annotations are a small subset of the full validation dataset, used for eval the training per epoch
-    val_dataset = Masks_Dataset(args.root, args.patch_size, args.reverse, N_masks_per_batch = 48,  order = args.order, val = True)
+    val_dataset = Masks_Dataset(args.root, args.patch_size, args.reverse, N_masks_per_batch=args.N_masks_per_batch,  order = args.order, val = True)
     # val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=helpers.our_collate_fn, num_workers = 8, shuffle=False, pin_memory = False, prefetch_factor=2)
-    val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, num_workers = 12, shuffle=False, pin_memory = False, prefetch_factor=2)
+    val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, num_workers = 16, shuffle=False, prefetch_factor=2)
     
     # Pre-select samples for qualitative visualization
     if args.qual_json is not None:

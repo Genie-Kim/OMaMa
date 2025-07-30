@@ -15,7 +15,7 @@ import evaluation.utils as utils
 
 CONF_THRESH = 0.5
 
-def evaluate_take(gt, pred):
+def evaluate_take(gt, pred, take_id, get_iou_per_imageid=False):
     
     IoUs = []
     ShapeAcc = []
@@ -28,6 +28,9 @@ def evaluate_take(gt, pred):
     ObjSizeGT = []
     ObjSizePred = []
     IMSize = []
+    
+    # Dictionary to store per-image IoU values
+    per_image_ious = {} if get_iou_per_imageid else None
 
     for object_id in sorted(gt['masks'].keys()):
         ego_cams = [x for x in gt['masks'][object_id].keys() if 'aria' in x]
@@ -92,6 +95,14 @@ def evaluate_take(gt, pred):
                     ObjSizeGT.append(np.sum(gt_mask).item())
                     ObjSizePred.append(np.sum(pred_mask).item())
                     IMSize.append(list(gt_mask.shape[:2]))
+                    
+                    # Store per-image IoU if requested
+                    if get_iou_per_imageid:
+                        # Create image ID as "{take_id}_{camname}_{objectname}"
+                        image_id = f"{take_id}_{EGOCAM}_{object_id}"
+                        if image_id not in per_image_ious:
+                            per_image_ious[image_id] = {}
+                        per_image_ious[image_id][frame_idx] = iou
                    
 
                 ObjExist_GT.append(gt_obj_exists)
@@ -104,7 +115,7 @@ def evaluate_take(gt, pred):
     LocationScores = np.array(LocationScores)
 
     return IoUs.tolist(), ShapeAcc.tolist(), ExistenceAcc.tolist(), LocationScores.tolist(), \
-            ObjExist_GT, ObjExist_Pred, ObjSizeGT, ObjSizePred, IMSize
+            ObjExist_GT, ObjExist_Pred, ObjSizeGT, ObjSizePred, IMSize, per_image_ious
 
 def validate_predictions(gt, preds):
 
@@ -155,7 +166,7 @@ def validate_predictions(gt, preds):
                     for key in ["pred_mask", "confidence"]:
                         assert key in preds["results"][take_id]["masks"][obj][f"{cam}_{ego_cam}"][idx]
 
-def evaluate_exoego(gt, preds):
+def evaluate_exoego(gt, preds, get_iou_per_imageid=False):
 
     validate_predictions(gt, preds)
     preds = preds["exo-ego"]
@@ -171,14 +182,17 @@ def evaluate_exoego(gt, preds):
 
     total_obj_exists_gt = []
     total_obj_exists_pred = []
+    
+    # Dictionary to store per-image IoU values
+    iou_per_imageid = {} if get_iou_per_imageid else None
 
 
     for take_id in tqdm.tqdm(gt["annotations"]):
 
 
         ious, shape_accs, existence_accs, location_scores, obj_exist_gt, obj_exist_pred, \
-            obj_size_gt, obj_size_pred, img_sizes = evaluate_take(gt["annotations"][take_id], 
-                                                                  preds["results"][take_id])
+            obj_size_gt, obj_size_pred, img_sizes, per_image_ious = evaluate_take(gt["annotations"][take_id], 
+                                                                  preds["results"][take_id], take_id, get_iou_per_imageid)
 
         total_iou += ious
         total_shape_acc += shape_accs
@@ -191,6 +205,10 @@ def evaluate_exoego(gt, preds):
 
         total_obj_exists_gt += obj_exist_gt
         total_obj_exists_pred += obj_exist_pred
+        
+        # Collect per-image IoU data
+        if get_iou_per_imageid and per_image_ious:
+            iou_per_imageid.update(per_image_ious)
 
 
     balanced_acc = balanced_accuracy_score(total_obj_exists_gt, total_obj_exists_pred)
@@ -201,7 +219,13 @@ def evaluate_exoego(gt, preds):
     print('TOTAL LOCATION SCORE: ', location_score)
     shape_acc = np.mean(total_shape_acc)
     print('TOTAL SHAPE ACC: ', shape_acc)
-    return {'iou': iou, 'shape_acc': shape_acc, 'location_score': location_score, 'balanced_acc': balanced_acc}
+    result_dict = {'iou': iou, 'shape_acc': shape_acc, 'location_score': location_score, 'balanced_acc': balanced_acc}
+    
+    # Add per-image IoU data if requested
+    if get_iou_per_imageid:
+        result_dict['iou_per_imageid'] = iou_per_imageid
+    
+    return result_dict
 
 
 def main(args):

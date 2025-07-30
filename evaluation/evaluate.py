@@ -57,15 +57,15 @@ def add_to_json(img_pth1, img_pth2, gt_mask, reverse,
 from evaluation.evaluate_egoexo import evaluate_egoexo
 from evaluation.evaluate_exoego import evaluate_exoego
 
-def evaluate(gt_json, pred_json, reverse):
+def evaluate(gt_json, pred_json, reverse, get_iou_per_imageid=False):
     if reverse:
         setting = "exo-ego"
         output = {'version': "00",  "challenge": "correspondence",setting: {'results': pred_json}}
         gt = {'version': "00",  "challenge": "correspondence",'annotations': gt_json}
-        out_dict = evaluate_exoego(gt, output)
+        out_dict = evaluate_exoego(gt, output, get_iou_per_imageid)
     else:
         setting = "ego-exo"
         output = {'version': "00",  "challenge": "correspondence",setting: {'results': pred_json}}
         gt = {'version': "00",  "challenge": "correspondence",'annotations': gt_json}
-        out_dict = evaluate_egoexo(gt, output)
+        out_dict = evaluate_egoexo(gt, output, get_iou_per_imageid)
     return out_dict

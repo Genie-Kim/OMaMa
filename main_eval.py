@@ -6,6 +6,7 @@ import argparse
 import torch
 import numpy as np
 import json
+import csv
 
 from descriptors.get_descriptors import DescriptorExtractor
 from dataset.dataset_masks import Masks_Dataset
@@ -27,6 +28,8 @@ def compute_IoU(pred_mask, gt_mask):
 def convert_ndarray(obj):
     if isinstance(obj, np.ndarray):
         return obj.tolist()
+    elif isinstance(obj, np.generic):  # Handle numpy scalar types (np.float32, np.int32, etc.)
+        return obj.item()
     elif isinstance(obj, dict):
         return {k: convert_ndarray(v) for k, v in obj.items()}
     elif isinstance(obj, list):
@@ -34,15 +37,6 @@ def convert_ndarray(obj):
     else:
         return obj
 
-
-"""
-python main_qual.py \                                   
-    --reverse \                                         
-    --root Ego-Exo4d \                                  
-    --devices 0 \                                       
-    --checkpoint_dir pretrained_models/Exo2Ego.pt \            
-    --exp_name Eval_OMAMA_0fe5b647
-"""
 
 
 if __name__ == "__main__":
@@ -54,8 +48,8 @@ if __name__ == "__main__":
     parser.add_argument("--context_size", type=int, default=20, help="Size of the context sizo for the object")
     parser.add_argument("--devices", default="0", type=str)
     parser.add_argument("--N_masks_per_batch", default=32, type=int)
-    parser.add_argument("--exp_name", type=str, default="Evaluation_OMAMA_Ego->Exo")
-    parser.add_argument("--checkpoint_dir", type=str, default="model_weights/best_IoU_Train_OMAMA_ExoEgo.pt")
+    parser.add_argument("--checkpoint_dir", type=str, default="pretrained_models/Exo2Ego.pt")
+    parser.add_argument("--get_iou_per_imageid", action="store_true", default=False, help="Get IoU values per image ID")
     args = parser.parse_args()
 
     helpers.set_all_seeds(42)
@@ -67,9 +61,9 @@ if __name__ == "__main__":
     else:
         device = 'cpu'
     
-    #The validation dataset is used for evaluation
-    test_dataset = Masks_Dataset(args.root, args.patch_size, args.reverse, train = False, N_masks_per_batch=args.N_masks_per_batch,order = args.order, test = False)
-    test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers = 1, pin_memory = True)
+    
+    test_dataset = Masks_Dataset(args.root, args.patch_size, args.reverse, N_masks_per_batch=args.N_masks_per_batch,order = args.order, train=False, val=False, test = True)
+    test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=16, pin_memory=True, prefetch_factor=16)
 
     descriptor_extractor = DescriptorExtractor('dinov2_vitb14_reg',  args.patch_size, args.context_size, device)
     model = Attention_projector(args.reverse).to(device)
@@ -91,20 +85,28 @@ if __name__ == "__main__":
                                                                                                 batch['POS_mask_position'], batch['is_visible'],
                                                                                                 batch['DEST_SAM_masks'], test_mode = True)
         
-        pred_mask = pred_mask.squeeze().detach().cpu().numpy()
-        confidence = similarities.detach().cpu().numpy()  
+        # Extract confidence scores
+        confidence = similarities.detach().cpu().numpy()
         
-        pred_json_test, gt_json_test = add_to_json(test_dataset, batch['pair_idx'], 
-                                                   pred_mask, confidence,
-                                                   processed_test, pred_json_test, gt_json_test)
-
-    json_dir = Path('results_json')
+        # Extract predicted mask (batch_size=1 for test)
+        mask_idx = pred_masks_idx[0].item()
+        pred_mask = batch['DEST_SAM_masks'][0, mask_idx, :, :].detach().cpu().numpy()
+        
+        # Add to evaluation JSON
+        pred_json_test, gt_json_test = add_to_json(
+            batch['img_pth1'][0], batch['img_pth2'][0], 
+            batch['GT_mask'][0].detach().cpu().numpy(), args.reverse,
+            pred_mask, confidence[0] if len(confidence.shape) > 0 else confidence,
+            processed_test, pred_json_test, gt_json_test)
+    
+    exp_path = Path(os.path.dirname(args.checkpoint_dir))
+    json_dir = Path(exp_path/'quantitative_results')
     json_dir.mkdir(parents=True, exist_ok=True)
     final_json_gt = {"version": "xx",
                     "challenge": "xx",
                     "annotations": gt_json_test}
 
-    out_dict = evaluate(gt_json_test, pred_json_test, args.reverse)
+    out_dict = evaluate(gt_json_test, pred_json_test, args.reverse, args.get_iou_per_imageid)
 
     #Saving the json with the results
     if args.reverse:
@@ -116,7 +118,7 @@ if __name__ == "__main__":
         for key in ["results"]:
             assert key in preds.keys()
 
-        save_path = os.path.join(json_dir, 'exo2ego_predictions_' + args.exp_name + '.json')
+        save_path = os.path.join(json_dir, 'exo2ego_predictions.json')
         save_path_gt = os.path.join(json_dir, 'exo2egoGT.json')
     else:
         final_json = {'ego-exo':{'results': pred_json_test}}
@@ -127,7 +129,7 @@ if __name__ == "__main__":
         for key in ["results"]:
             assert key in preds.keys()
         
-        save_path = os.path.join(json_dir, 'ego2exo_predictions_' + args.exp_name + '.json')
+        save_path = os.path.join(json_dir, 'ego2exo_predictions.json')
         save_path_gt = os.path.join(json_dir, 'ego2exoGT.json')
 
     with open(save_path, 'w') as f:
@@ -135,5 +137,47 @@ if __name__ == "__main__":
 
     with open(save_path_gt, 'w') as f:
         json.dump(convert_ndarray(final_json_gt), f)
+    
+    # Save per-image IoU data if available
+    if args.get_iou_per_imageid and 'iou_per_imageid' in out_dict:
+        iou_save_path = os.path.join(json_dir, 'per_image_iou.json')
+        with open(iou_save_path, 'w') as f:
+            json.dump(out_dict['iou_per_imageid'], f, indent=2)
+        print(f"Per-image IoU data saved to: {iou_save_path}")
+        
+        # Create CSV file with take_id, camera_name, object_name, average_iou
+        csv_save_path = os.path.join(json_dir, 'per_image_iou_summary.csv')
+        csv_data = []
+        
+        for image_id, frame_ious in out_dict['iou_per_imageid'].items():
+            # Parse image_id: "{take_id}_{camera_name}_{object_name}"
+            parts = image_id.split('_')
+            if len(parts) >= 3:
+                take_id = parts[0]
+                camera_name = parts[1]
+                object_name = '_'.join(parts[2:])  # Handle object names with underscores
+                
+                # Calculate average IoU across all frames
+                iou_values = list(frame_ious.values())
+                avg_iou = np.mean(iou_values) if iou_values else 0.0
+                
+                csv_data.append({
+                    'take_id': take_id,
+                    'camera_name': camera_name,
+                    'object_name': object_name,
+                    'average_iou': avg_iou
+                })
+        
+        # Sort by average_iou in ascending order (lowest first)
+        csv_data.sort(key=lambda x: x['average_iou'])
+        
+        # Write to CSV
+        with open(csv_save_path, 'w', newline='') as csvfile:
+            fieldnames = ['take_id', 'camera_name', 'object_name', 'average_iou']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(csv_data)
+        
+        print(f"Per-image IoU summary CSV saved to: {csv_save_path}")
     
     
