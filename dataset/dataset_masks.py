@@ -255,7 +255,7 @@ class Masks_Dataset(Dataset):
         SAM_masks = np.load(f"{self.masks_dir}/{take_id2}/{cam2}/{vid_idx2}_masks.npz")
         SAM_masks = torch.from_numpy(SAM_masks['arr_0'].astype(np.uint8)) # N, H, W. H = 532, W = 952
         if len(SAM_masks.shape) < 3:
-            SAM_masks = torch.zeros((1, self.h2, self.w2))
+            SAM_masks = torch.zeros((1, self.h2, self.w2), dtype=torch.uint8)
         N_masks, H_masks, W_masks = SAM_masks.shape
         if H_masks != self.h2 or W_masks != self.w2: # Only in inference for FastSAM masks
             SAM_masks = F.interpolate(SAM_masks.unsqueeze(0).float(), size=(self.h2, self.w2), mode='nearest').squeeze(0).to(torch.uint8)

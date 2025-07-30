@@ -17,13 +17,24 @@ import numpy as np
 import cv2
 import random
 from datetime import datetime
-import itertools
+from collections import defaultdict
+import json
 
 
-def select_qualitative_samples(val_dataset, num_takes=3, frames_per_take=5):
-    """Pre-select samples for qualitative visualization during validation"""
-    random.seed(42)  # For reproducibility
-    
+def select_qualitative_samples(val_dataset, num_takes=3, frames_per_take=5, user_set=None):
+    """Pre-select samples for qualitative visualization during validation
+    if user_set is not None, use the user_set to select the samples
+    user_set is a dictionary with the following structure:
+    {
+        "take_id": [
+            (object_name, frame_idx),
+            (object_name, frame_idx),
+            ...
+        ]
+    }
+    else, select the samples randomly
+    """
+    random.seed(49)
     # Group pairs by take_id
     take_to_pairs = {}
     for idx, pair in enumerate(val_dataset.pairs):
@@ -36,26 +47,43 @@ def select_qualitative_samples(val_dataset, num_takes=3, frames_per_take=5):
             take_to_pairs[take_id] = []
         take_to_pairs[take_id].append((idx, camera_name, object_name, frame_idx))
     
-    # Randomly select take_ids
-    all_take_ids = list(take_to_pairs.keys())
-    selected_take_ids = random.sample(all_take_ids, min(num_takes, len(all_take_ids)))
-    
-    # For each selected take_id, select up to frames_per_take frames
-    qualitative_selections = {}
-    for take_id in selected_take_ids:
-        pairs = take_to_pairs[take_id]
-        # Sort by frame index
-        pairs.sort(key=lambda x: x[2])  # Sort by frame_idx which is now at index 2
-        # Select evenly spaced frames
-        if len(pairs) <= frames_per_take:
-            selected_pairs = pairs
-        else:
-            # Select evenly spaced indices
-            indices = np.linspace(0, len(pairs)-1, frames_per_take, dtype=int)
-            selected_pairs = [pairs[i] for i in indices]
+    if user_set is not None:
+        # Use user-specified selections
+        qualitative_selections = {}
+        for take_id, selections in user_set.items():
+            if take_id in take_to_pairs:
+                matched_pairs = []
+                # Find matching pairs for each (object_name, frame_idx) in selections
+                for target_obj, target_frame in selections:
+                    for idx, camera_name, obj_name, frame_idx in take_to_pairs[take_id]:
+                        if obj_name == target_obj and frame_idx == target_frame:
+                            matched_pairs.append((camera_name, obj_name, frame_idx))
+                            break
+                if matched_pairs:
+                    qualitative_selections[take_id] = matched_pairs
+    else:
+        # Randomly select take_ids
+        all_take_ids = list(take_to_pairs.keys())
+        selected_take_ids = random.sample(all_take_ids, min(num_takes, len(all_take_ids)))
         
-        # Store as (camera_name, object_name, frame_idx) for each take_id
-        qualitative_selections[take_id] = [(camera_name, object_name, frame_idx) for _, camera_name, object_name, frame_idx in selected_pairs]
+        # For each selected take_id, select up to frames_per_take frames
+        qualitative_selections = {}
+        for take_id in selected_take_ids:
+            pairs = take_to_pairs[take_id]
+            # Sort by frame index
+            pairs.sort(key=lambda x: x[2])  # Sort by frame_idx which is now at index 2
+            # Select evenly spaced frames
+            if len(pairs) <= frames_per_take:
+                selected_pairs = pairs
+            else:
+                # Select consecutive frames from a random starting point
+                max_start = len(pairs) - frames_per_take
+                start_idx = random.randint(0, max_start)
+                indices = range(start_idx, start_idx + frames_per_take)
+                selected_pairs = [pairs[i] for i in indices]
+            
+            # Store as (camera_name, object_name, frame_idx) for each take_id
+            qualitative_selections[take_id] = [(camera_name, object_name, frame_idx) for _, camera_name, object_name, frame_idx in selected_pairs]
     
     return qualitative_selections
 
@@ -64,13 +92,11 @@ def run_validation(model, descriptor_extractor, val_dataloader, val_dataset,
                    args, qualitative_dir, exp_dir, exp_name, current_epoch, 
                    global_step, best_IoU, DEBUG_MODE, qualitative_selections):
     """Run validation and save checkpoints"""
-    print(f'----- Step {global_step} (Epoch {current_epoch:.2f}) Validation -----')
     # Validation loop
     processed_epoch, pred_json_epoch, gt_json_epoch = {}, {}, {}
     epoch_loss = 0
     qualitative_data = []  # Collect qualitative samples for batch processing
     model.eval()
-
     for idx, batch in enumerate(tqdm(val_dataloader)):
         with torch.no_grad():
             DEST_descriptors, DEST_img_feats = descriptor_extractor.get_DEST_descriptors(batch)
@@ -140,15 +166,23 @@ def run_validation(model, descriptor_extractor, val_dataloader, val_dataset,
     # Process all qualitative visualizations at once
     if qualitative_data:
         wandb_images = {}
+        
+        # Group data by take_id and object_name
+        grouped_data = defaultdict(list)
         for data in qualitative_data:
+            key = f"{data['take_id']}_{data['object_name']}"
+            grouped_data[key].append(data)
+        
+        # Process each group
+        for key, data_list in grouped_data.items():
             try:
                 saved_path = create_qualitative_visualization(
-                    data['sample_batch'], data['pred_mask'], qualitative_dir, 
-                    data['take_id'], data['frame_idx']
+                    data_list, qualitative_dir, key
                 )
-                wandb_images[f"qualitative/{data['take_id']}/frame_{data['frame_idx']}"] = wandb.Image(saved_path)
+                if saved_path:
+                    wandb_images[f"qualitative/{key}/all_frames"] = wandb.Image(saved_path)
             except Exception as e:
-                print(f"Warning: Failed to create qualitative visualization: {e}")
+                print(f"Warning: Failed to create qualitative visualization for {key}: {e}")
         
         # Add epoch info and log all qualitative images at once
         wandb_images["epoch"] = current_epoch
@@ -156,8 +190,11 @@ def run_validation(model, descriptor_extractor, val_dataloader, val_dataset,
             wandb.log(wandb_images)
     
     # Log validation metrics to WandB
-    wandb.log({f"val/{k}": v for k, v in out_dict.items()})
-    wandb.log({"val/loss": epoch_loss, "val/epoch": current_epoch})
+    wandb.log({
+        **{f"val/{k}": v for k, v in out_dict.items()},
+        "val/loss": epoch_loss,
+        "val/epoch": current_epoch
+    })
     
     if out_dict['iou'] > best_IoU:
         best_IoU = out_dict['iou']
@@ -166,86 +203,108 @@ def run_validation(model, descriptor_extractor, val_dataloader, val_dataset,
     return best_IoU
 
 
-def create_qualitative_visualization(batch, pred_mask, qualitative_dir, data_id_prefix, frame_idx):
-    """Create side-by-side visualization adapted from main_qual.py"""
-    # Extract and denormalize images
-    source_img = batch['SOURCE_img'][0].cpu().numpy().transpose(1, 2, 0)
-    dest_img = batch['GT_img'][0].cpu().numpy().transpose(1, 2, 0)
+def create_qualitative_visualization(data_list, qualitative_dir, data_id_prefix):
+    """Create side-by-side visualization for multiple frames and concatenate vertically"""
+    combined_images = []
     
-    # Denormalize images
-    mean = np.array([0.485, 0.456, 0.406])
-    std = np.array([0.229, 0.224, 0.225])
-    source_img = (source_img * std + mean).clip(0, 1)
-    dest_img = (dest_img * std + mean).clip(0, 1)
+    # Sort data_list by frame_idx to ensure consistent ordering
+    data_list = sorted(data_list, key=lambda x: x['frame_idx'])
     
-    # Get masks
-    source_gt_mask = batch['SOURCE_mask'][0].squeeze().cpu().numpy()
-    dest_gt_mask = batch['GT_mask'][0].squeeze().cpu().numpy()
+    for data in data_list:
+        batch = data['sample_batch']
+        pred_mask = data['pred_mask']
+        frame_idx = data['frame_idx']
+        
+        # Extract and denormalize images
+        source_img = batch['SOURCE_img'][0].cpu().numpy().transpose(1, 2, 0)
+        dest_img = batch['GT_img'][0].cpu().numpy().transpose(1, 2, 0)
+        
+        # Denormalize images
+        mean = np.array([0.485, 0.456, 0.406])
+        std = np.array([0.229, 0.224, 0.225])
+        source_img = (source_img * std + mean).clip(0, 1)
+        dest_img = (dest_img * std + mean).clip(0, 1)
+        
+        # Get masks
+        source_gt_mask = batch['SOURCE_mask'][0].squeeze().cpu().numpy()
+        dest_gt_mask = batch['GT_mask'][0].squeeze().cpu().numpy()
+        
+        # Resize to 480px height while maintaining aspect ratio
+        target_height = 480
+        source_h, source_w = source_img.shape[:2]
+        dest_h, dest_w = dest_img.shape[:2]
+        
+        # Resize source image and mask
+        if source_h != target_height:
+            new_w = int(source_w * target_height / source_h)
+            source_img = cv2.resize(source_img, (new_w, target_height), interpolation=cv2.INTER_LINEAR)
+            source_gt_mask = cv2.resize(source_gt_mask.astype(np.float32), (new_w, target_height), interpolation=cv2.INTER_LINEAR)
+            source_gt_mask = (source_gt_mask > 0.5).astype(np.float32)
+        
+        # Resize dest image and masks
+        if dest_h != target_height:
+            new_w = int(dest_w * target_height / dest_h)
+            dest_img = cv2.resize(dest_img, (new_w, target_height), interpolation=cv2.INTER_LINEAR)
+            dest_gt_mask = cv2.resize(dest_gt_mask.astype(np.float32), (new_w, target_height), interpolation=cv2.INTER_LINEAR)
+            dest_gt_mask = (dest_gt_mask > 0.5).astype(np.float32)
+            pred_mask_resized = cv2.resize(pred_mask.astype(np.float32), (new_w, target_height), interpolation=cv2.INTER_LINEAR)
+            pred_mask_resized = (pred_mask_resized > 0.5).astype(np.float32)
+        else:
+            pred_mask_resized = pred_mask
+        
+        # Create overlay masks
+        # 1. Source image with GT mask (red, α=0.7)
+        source_overlay = source_img.copy()
+        red_mask = np.zeros_like(source_img)
+        red_mask[:, :, 0] = 1.0
+        source_overlay = np.where(source_gt_mask[..., np.newaxis], 
+                                  source_overlay * 0.3 + red_mask * 0.7, 
+                                  source_overlay)
+        
+        # 2. Target image with GT mask (red, α=0.5) and pred mask (blue, α=0.7)
+        target_overlay = dest_img.copy()
+        
+        # Add GT mask (red, α=0.5)
+        red_mask = np.zeros_like(dest_img)
+        red_mask[:, :, 0] = 1.0
+        target_overlay = np.where(dest_gt_mask[..., np.newaxis], 
+                                  target_overlay * 0.5 + red_mask * 0.5, 
+                                  target_overlay)
+        
+        # Add pred mask (blue, α=0.7)
+        blue_mask = np.zeros_like(dest_img)
+        blue_mask[:, :, 2] = 1.0  # Blue channel
+        target_overlay = np.where(pred_mask_resized[..., np.newaxis], 
+                                  target_overlay * 0.3 + blue_mask * 0.7, 
+                                  target_overlay)
+        
+        # Combine images horizontally
+        combined_image = np.hstack([source_overlay, target_overlay])
+        
+        # Convert to BGR for cv2 and scale to 0-255
+        combined_image_bgr = cv2.cvtColor((combined_image * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+        
+        # Add frame index label
+        cv2.putText(combined_image_bgr, f"Frame {frame_idx}", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        
+        combined_images.append(combined_image_bgr)
     
-    # Resize to 480px height while maintaining aspect ratio
-    target_height = 480
-    source_h, source_w = source_img.shape[:2]
-    dest_h, dest_w = dest_img.shape[:2]
+    # Concatenate all images vertically
+    if combined_images:
+        final_image = cv2.vconcat(combined_images)
+        
+        # Create data_id directory
+        data_id_dir = qualitative_dir / data_id_prefix
+        data_id_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save concatenated image
+        save_file = data_id_dir / "all_frames.jpg"
+        cv2.imwrite(str(save_file), final_image)
+        
+        return str(save_file)
     
-    # Resize source image and mask
-    if source_h != target_height:
-        new_w = int(source_w * target_height / source_h)
-        source_img = cv2.resize(source_img, (new_w, target_height), interpolation=cv2.INTER_LINEAR)
-        source_gt_mask = cv2.resize(source_gt_mask.astype(np.float32), (new_w, target_height), interpolation=cv2.INTER_LINEAR)
-        source_gt_mask = (source_gt_mask > 0.5).astype(np.float32)
-    
-    # Resize dest image and masks
-    if dest_h != target_height:
-        new_w = int(dest_w * target_height / dest_h)
-        dest_img = cv2.resize(dest_img, (new_w, target_height), interpolation=cv2.INTER_LINEAR)
-        dest_gt_mask = cv2.resize(dest_gt_mask.astype(np.float32), (new_w, target_height), interpolation=cv2.INTER_LINEAR)
-        dest_gt_mask = (dest_gt_mask > 0.5).astype(np.float32)
-        pred_mask_resized = cv2.resize(pred_mask.astype(np.float32), (new_w, target_height), interpolation=cv2.INTER_LINEAR)
-        pred_mask_resized = (pred_mask_resized > 0.5).astype(np.float32)
-    else:
-        pred_mask_resized = pred_mask
-    
-    # Create overlay masks
-    # 1. Source image with GT mask (red, α=0.7)
-    source_overlay = source_img.copy()
-    red_mask = np.zeros_like(source_img)
-    red_mask[:, :, 0] = 1.0
-    source_overlay = np.where(source_gt_mask[..., np.newaxis], 
-                              source_overlay * 0.3 + red_mask * 0.7, 
-                              source_overlay)
-    
-    # 2. Target image with GT mask (red, α=0.5) and pred mask (blue, α=0.7)
-    target_overlay = dest_img.copy()
-    
-    # Add GT mask (red, α=0.5)
-    red_mask = np.zeros_like(dest_img)
-    red_mask[:, :, 0] = 1.0
-    target_overlay = np.where(dest_gt_mask[..., np.newaxis], 
-                              target_overlay * 0.5 + red_mask * 0.5, 
-                              target_overlay)
-    
-    # Add pred mask (blue, α=0.7)
-    blue_mask = np.zeros_like(dest_img)
-    blue_mask[:, :, 2] = 1.0  # Blue channel
-    target_overlay = np.where(pred_mask_resized[..., np.newaxis], 
-                              target_overlay * 0.3 + blue_mask * 0.7, 
-                              target_overlay)
-    
-    # Combine images horizontally
-    combined_image = np.hstack([source_overlay, target_overlay])
-    
-    # Convert to BGR for cv2 and scale to 0-255
-    combined_image_bgr = cv2.cvtColor((combined_image * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-    
-    # Create data_id directory
-    data_id_dir = qualitative_dir / data_id_prefix
-    data_id_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Save image
-    save_file = data_id_dir / f"frame_{frame_idx}.jpg"
-    cv2.imwrite(str(save_file), combined_image_bgr)
-    
-    return str(save_file)
+    return None
 
 
 if __name__ == "__main__":
@@ -257,10 +316,13 @@ if __name__ == "__main__":
     parser.add_argument("--devices", default="0", type=str)
     parser.add_argument("--N_masks_per_batch", default=32, type=int)
     parser.add_argument("--batch_size", default=24, type=int)
-    parser.add_argument("--max_iterations", default=100000, type=int, help="Maximum training iterations")
+    parser.add_argument("--max_iterations", default=300000, type=int, help="Maximum training iterations")
     parser.add_argument("--order", default=2, type=int, help="order of adjacency matrix, 2 for 2nd order")
     parser.add_argument("--exp_name", type=str, default="Train_OMAMA")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode for development")
+    parser.add_argument("--qual_json", type=str, default=None, help="Path to the qualitative samples json file")
+    parser.add_argument("--lr", type=float, default=8e-5, help="Learning rate")
+
     args = parser.parse_args()
     # making exp name with date and view change
     if args.reverse:
@@ -289,23 +351,28 @@ if __name__ == "__main__":
     # Training dataset only contains horizontal images, in order to batchify the masks
     train_dataset = Masks_Dataset(args.root, args.patch_size, args.reverse, N_masks_per_batch=args.N_masks_per_batch, order = args.order, train = True)
     # train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=helpers.our_collate_fn, num_workers = 8, pin_memory = False, prefetch_factor=2)
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers = 16, pin_memory = True, prefetch_factor=2)
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers = 12, pin_memory = False, prefetch_factor=2)
     
     # Validation dataset contains both horizontal and vertical images. Now supports batch processing for efficiency
     # Note: the val annotations are a small subset of the full validation dataset, used for eval the training per epoch
     val_dataset = Masks_Dataset(args.root, args.patch_size, args.reverse, N_masks_per_batch = 48,  order = args.order, val = True)
     # val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=helpers.our_collate_fn, num_workers = 8, shuffle=False, pin_memory = False, prefetch_factor=2)
-    val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, num_workers = 16, shuffle=False, pin_memory = True, prefetch_factor=2)
+    val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, num_workers = 12, shuffle=False, pin_memory = False, prefetch_factor=2)
     
     # Pre-select samples for qualitative visualization
-    qualitative_selections = select_qualitative_samples(val_dataset, num_takes=2, frames_per_take=4)
+    if args.qual_json is not None:
+        with open(args.qual_json, 'r') as f:
+            user_set = json.load(f)
+        qualitative_selections = select_qualitative_samples(val_dataset, num_takes=3, frames_per_take=4, user_set=user_set)
+    else:
+        qualitative_selections = select_qualitative_samples(val_dataset, num_takes=3, frames_per_take=4)
     print(f"Pre-selected {len(qualitative_selections)} takes for qualitative visualization")
 
     descriptor_extractor = DescriptorExtractor('dinov2_vitb14_reg', args.patch_size, args.context_size, device)
     model = Attention_projector(reverse = args.reverse).to(device)
     print(model)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=8e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     T_max = args.max_iterations
     scheduler = CosineAnnealingLR(optimizer, args.max_iterations, eta_min=1e-6)
 
@@ -317,6 +384,7 @@ if __name__ == "__main__":
 
     # Initialize training variables
     global_step = 0
+    current_epoch = 0
     eval_step = 2000
     best_IoU = 0
     train_iter = iter(train_dataloader) 
@@ -326,6 +394,18 @@ if __name__ == "__main__":
 
     # Training loop
     while global_step < args.max_iterations:
+        # Validation every eval_step
+        if global_step % eval_step == 0:
+            if global_step > 0:
+                # Save checkpoint before validation
+                torch.save(model.state_dict(), exp_dir / f'step_{global_step}_epoch_{current_epoch:.2f}_{exp_name}.pt')
+            
+            # Run validation
+            best_IoU = run_validation(model, descriptor_extractor, val_dataloader, val_dataset,
+                                     args, qualitative_dir, exp_dir, exp_name, current_epoch,
+                                     global_step, best_IoU, DEBUG_MODE, qualitative_selections)
+
+        # Training
         model.train()
         try:
             batch = next(train_iter)      # 다음 배치
@@ -352,22 +432,13 @@ if __name__ == "__main__":
         wandb.log({
             "train/loss": loss.item(), 
             "train/epoch": current_epoch, 
-            "train/step": global_step
+            "train/step": global_step,
+            "train/learning_rate": scheduler.get_last_lr()[0]
         })
         
         # Print progress every 100 steps
         if global_step % 100 == 0:
             print(f'Step {global_step}/{args.max_iterations} (Epoch {current_epoch:.2f}), Loss: {loss.item():.4f}')
-
-        # Validation every eval_step
-        if global_step % eval_step == 0:
-            # Save checkpoint before validation
-            torch.save(model.state_dict(), exp_dir / f'step_{global_step}_epoch_{current_epoch:.2f}_{exp_name}.pt')
-            
-            # Run validation
-            best_IoU = run_validation(model, descriptor_extractor, val_dataloader, val_dataset,
-                                     args, qualitative_dir, exp_dir, exp_name, current_epoch,
-                                     global_step, best_IoU, DEBUG_MODE, qualitative_selections)
         
         # Debug mode: limit training iterations
         if DEBUG_MODE and global_step >= 2:
