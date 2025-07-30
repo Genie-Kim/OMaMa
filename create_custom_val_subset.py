@@ -48,7 +48,7 @@ def main(input_file_name, output_file_name):
     print(f"Unique (take_id, ego_camera, exo_camera, object_name) combinations: {len(unique_pairs)}")
     
     # Randomly select 40% of unique pairs
-    num_to_select = max(1, int(len(unique_pairs) * 0.4))
+    num_to_select = max(1, int(len(unique_pairs) * 0.6))
     selected_pairs = random.sample(unique_pairs, num_to_select)
     
     print(f"Selected {num_to_select} unique combinations (40%)")
