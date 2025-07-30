@@ -316,7 +316,7 @@ if __name__ == "__main__":
     parser.add_argument("--devices", default="0", type=str)
     parser.add_argument("--N_masks_per_batch", default=32, type=int)
     parser.add_argument("--batch_size", default=24, type=int)
-    parser.add_argument("--max_iterations", default=300000, type=int, help="Maximum training iterations")
+    parser.add_argument("--max_iterations", default=10000, type=int, help="Maximum training iterations")
     parser.add_argument("--order", default=2, type=int, help="order of adjacency matrix, 2 for 2nd order")
     parser.add_argument("--exp_name", type=str, default="Train_OMAMA")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode for development")
@@ -385,7 +385,7 @@ if __name__ == "__main__":
     # Initialize training variables
     global_step = 0
     current_epoch = 0
-    eval_step = 2000
+    eval_step = 500
     best_IoU = 0
     train_iter = iter(train_dataloader) 
     trainset_length = len(train_dataloader)
