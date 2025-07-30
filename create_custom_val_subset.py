@@ -3,6 +3,11 @@ import random
 from pathlib import Path
 from collections import defaultdict
 
+# Custom validation subset sampling strategy:
+# 1. Groups frame pairs by (take_id, ego_camera, exo_camera, object_name)
+# 2. Randomly selects 60% of unique combinations
+# 3. Applies 1/16 temporal subsampling with random start + consecutive window
+# 4. Filters groups with <5 frames after reduction
 def extract_info_from_path(path):
     """Extract take_id, camera name, and object name from the path."""
     parts = path.split('//')
