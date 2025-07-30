@@ -8,6 +8,7 @@ checkpoints/
 *.zip
 wandb/
 missing_mask_files.json
+hddsdc
 
 Ego-Exo4d/
 
