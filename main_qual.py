@@ -183,12 +183,14 @@ if __name__ == "__main__":
     
 
     # Create qualitative folder
-    # qualitative_dir = Path('qualitative_results')
-    qualitative_dir = Path(os.path.join(os.path.dirname(args.checkpoint_dir), 'qualitative_results'))
     if args.qual_dir is not None:
-        qualitative_dir = Path(args.qual_dir)/qualitative_dir
+        # Extract the last folder name from checkpoint_dir
+        last_folder_name = Path(args.checkpoint_dir).parent.name
+        qualitative_dir = Path(args.qual_dir) / last_folder_name / 'qualitative_results'
     else:
-        qualitative_dir.mkdir(parents=True, exist_ok=True)
+        qualitative_dir = Path(os.path.join(os.path.dirname(args.checkpoint_dir), 'qualitative_results'))
+    
+    qualitative_dir.mkdir(parents=True, exist_ok=True)
     
     # Load model
     descriptor_extractor = DescriptorExtractor('dinov2_vitb14_reg',  args.patch_size, args.context_size, device)
