@@ -19,6 +19,7 @@ from torch.utils.data import Dataset
 # Local imports
 from dataset.adj_descriptors import get_adj_matrix
 from dataset.dataset_utils import compute_IoU, compute_IoU_bbox, bbox_from_mask
+from utils.mask_converter import MaskConverter
 
 
 class Masks_Dataset(Dataset):
@@ -69,6 +70,16 @@ class Masks_Dataset(Dataset):
         norm_mean, norm_std = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
         self.transform_img = transforms.Compose([transforms.ToTensor(), transforms.Normalize(norm_mean, norm_std)])
         
+        # Initialize mask converter for indexed mask optimization
+        self.mask_converter = MaskConverter(max_masks=256)
+        
+        # Memory usage statistics tracking
+        self.memory_stats = {
+            'total_masks_loaded': 0,
+            'total_memory_saved_bytes': 0,
+            'conversion_failures': 0,
+            'truncated_mask_samples': 0
+        }
         
         print(len(self.takes_json), 'TAKES')
 
@@ -134,6 +145,160 @@ class Masks_Dataset(Dataset):
         with open(self.mask_annotations_paths[take_id], 'r') as fp:
             annotations = json.load(fp)
         return annotations
+
+    def _load_sam_masks(self, mask_path: str, expected_size: tuple = None) -> tuple:
+        """
+        Load SAM masks from NPZ file and convert to indexed format for memory optimization.
+        
+        Args:
+            mask_path: Path to the NPZ mask file
+            expected_size: Expected (H, W) size for interpolation if needed
+            
+        Returns:
+            Tuple of (indexed_masks, original_num_masks, conversion_stats)
+            - indexed_masks: HxW tensor with uint8 indexed format (CPU memory)
+            - original_num_masks: Number of masks in original binary format
+            - conversion_stats: Dictionary with memory usage statistics
+        """
+        try:
+            # Load binary masks from NPZ file
+            sam_masks_data = np.load(mask_path)
+            binary_masks = torch.from_numpy(sam_masks_data['arr_0'].astype(np.uint8))  # N, H, W
+            
+            # Handle edge case where masks might be 2D (single mask)
+            if len(binary_masks.shape) < 3:
+                # Create empty mask set if no masks available
+                H, W = expected_size if expected_size else (512, 512)  # Default size fallback
+                binary_masks = torch.zeros((1, H, W), dtype=torch.uint8)
+            
+            original_num_masks, H, W = binary_masks.shape
+            
+            # Apply interpolation if size mismatch (maintaining original logic)
+            if expected_size and (H != expected_size[0] or W != expected_size[1]):
+                binary_masks = F.interpolate(
+                    binary_masks.unsqueeze(0).float(), 
+                    size=expected_size, 
+                    mode='nearest'
+                ).squeeze(0).to(torch.uint8)
+                H, W = expected_size
+            
+            # Convert binary masks to indexed format for memory optimization
+            indexed_masks = self.mask_converter.binary_to_indexed(binary_masks)
+            
+            # Calculate memory usage statistics
+            binary_memory = binary_masks.numel() * binary_masks.element_size()
+            indexed_memory = indexed_masks.numel() * indexed_masks.element_size()
+            memory_saved = binary_memory - indexed_memory
+            
+            conversion_stats = {
+                'original_num_masks': original_num_masks,
+                'original_height': H,
+                'original_width': W,
+                'binary_memory_bytes': binary_memory,
+                'indexed_memory_bytes': indexed_memory,
+                'memory_saved_bytes': memory_saved,
+                'reduction_factor': binary_memory / indexed_memory if indexed_memory > 0 else 0,
+                'truncated': original_num_masks > 256
+            }
+            
+            # Update dataset-level statistics
+            self.memory_stats['total_masks_loaded'] += 1
+            self.memory_stats['total_memory_saved_bytes'] += memory_saved
+            if original_num_masks > 256:
+                self.memory_stats['truncated_mask_samples'] += 1
+            
+            # Return indexed masks (kept in CPU memory for optimization), num_masks, and stats
+            return indexed_masks.cpu(), original_num_masks, conversion_stats
+            
+        except Exception as e:
+            # Handle conversion failures gracefully
+            self.memory_stats['conversion_failures'] += 1
+            
+            # Log the error with context
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(
+                f"Failed to load and convert masks from {mask_path}: {e}. "
+                f"Falling back to original binary format."
+            )
+            
+            # Fallback: return original binary masks without conversion
+            try:
+                sam_masks_data = np.load(mask_path)
+                binary_masks = torch.from_numpy(sam_masks_data['arr_0'].astype(np.uint8))
+                
+                if len(binary_masks.shape) < 3:
+                    H, W = expected_size if expected_size else (512, 512)
+                    binary_masks = torch.zeros((1, H, W), dtype=torch.uint8)
+                
+                if expected_size:
+                    original_num_masks, H, W = binary_masks.shape
+                    if H != expected_size[0] or W != expected_size[1]:
+                        binary_masks = F.interpolate(
+                            binary_masks.unsqueeze(0).float(), 
+                            size=expected_size, 
+                            mode='nearest'
+                        ).squeeze(0).to(torch.uint8)
+                
+                # Return binary masks as fallback (no memory optimization)
+                fallback_stats = {
+                    'original_num_masks': binary_masks.shape[0],
+                    'binary_memory_bytes': binary_masks.numel() * binary_masks.element_size(),
+                    'indexed_memory_bytes': 0,  # No optimization applied
+                    'memory_saved_bytes': 0,
+                    'reduction_factor': 1.0,
+                    'truncated': False,
+                    'fallback_used': True
+                }
+                
+                return binary_masks.cpu(), binary_masks.shape[0], fallback_stats
+                
+            except Exception as fallback_error:
+                # Complete failure - return minimal empty mask
+                logger.error(f"Complete mask loading failure: {fallback_error}")
+                H, W = expected_size if expected_size else (512, 512)
+                empty_mask = torch.zeros((H, W), dtype=torch.uint8)
+                error_stats = {
+                    'original_num_masks': 0,
+                    'binary_memory_bytes': 0,
+                    'indexed_memory_bytes': empty_mask.numel() * empty_mask.element_size(),
+                    'memory_saved_bytes': 0,
+                    'reduction_factor': 0,
+                    'truncated': False,
+                    'error': True
+                }
+                return empty_mask.cpu(), 0, error_stats
+
+    def get_memory_stats(self) -> dict:
+        """
+        Get comprehensive memory usage statistics for the dataset.
+        
+        Returns:
+            Dictionary with memory optimization metrics
+        """
+        stats = self.memory_stats.copy()
+        
+        # Calculate derived metrics
+        if stats['total_masks_loaded'] > 0:
+            stats['average_memory_saved_per_sample'] = (
+                stats['total_memory_saved_bytes'] / stats['total_masks_loaded']
+            )
+            stats['truncation_rate'] = (
+                stats['truncated_mask_samples'] / stats['total_masks_loaded']
+            )
+            stats['failure_rate'] = (
+                stats['conversion_failures'] / stats['total_masks_loaded']
+            )
+        else:
+            stats['average_memory_saved_per_sample'] = 0
+            stats['truncation_rate'] = 0
+            stats['failure_rate'] = 0
+        
+        # Convert bytes to MB for readability
+        stats['total_memory_saved_mb'] = stats['total_memory_saved_bytes'] / (1024 * 1024)
+        stats['average_memory_saved_per_sample_mb'] = stats['average_memory_saved_per_sample'] / (1024 * 1024)
+        
+        return stats
 
     # Returns the img reshaped slightly to be divisible by 14 (dinov2 patch size)
     def reshape_img(self, img):
@@ -251,25 +416,38 @@ class Masks_Dataset(Dataset):
         assert mask2_GT.shape == img2.shape[:2]
         mask2_GT = torch.from_numpy(mask2_GT.astype(np.uint8))
 
-        # Load the proposed pre-extracted SAM masks for this pair
-        SAM_masks = np.load(f"{self.masks_dir}/{take_id2}/{cam2}/{vid_idx2}_masks.npz")
-        SAM_masks = torch.from_numpy(SAM_masks['arr_0'].astype(np.uint8)) # N, H, W. H = 532, W = 952
-        if len(SAM_masks.shape) < 3:
-            SAM_masks = torch.zeros((1, self.h2, self.w2), dtype=torch.uint8)
-        N_masks, H_masks, W_masks = SAM_masks.shape
-        if H_masks != self.h2 or W_masks != self.w2: # Only in inference for FastSAM masks
-            SAM_masks = F.interpolate(SAM_masks.unsqueeze(0).float(), size=(self.h2, self.w2), mode='nearest').squeeze(0).to(torch.uint8)
+        # Load the proposed pre-extracted SAM masks for this pair using indexed format optimization
+        mask_file_path = f"{self.masks_dir}/{take_id2}/{cam2}/{vid_idx2}_masks.npz"
+        SAM_masks_indexed, N_masks, conversion_stats = self._load_sam_masks(
+            mask_file_path, 
+            expected_size=(self.h2, self.w2)
+        )
+        
+        # Store conversion statistics for debugging/monitoring (can be used by training pipeline)
+        # SAM_masks_indexed is now HxW uint8 tensor stored in CPU memory for optimization
+        # N_masks contains the original number of masks for compatibility with existing logic
         
         # Get the adjacent matrix (only needed for training)
+        # For adjacency calculation, we need binary masks temporarily
         if self.train_mode:
-            adj_matrix = get_adj_matrix(SAM_masks, order=self.order)
+            # Convert indexed masks back to binary format for adjacency matrix calculation
+            # This is needed only during training and only temporarily
+            SAM_masks_binary = self.mask_converter.indexed_to_binary(SAM_masks_indexed, N_masks)
+            adj_matrix = get_adj_matrix(SAM_masks_binary, order=self.order)
+            # Clean up temporary binary masks to save memory
+            del SAM_masks_binary
         else:
             adj_matrix = None
         
         SAM_bboxes_dest = np.load(f"{self.masks_dir}/{take_id2}/{cam2}/{vid_idx2}_boxes.npy")
         SAM_bboxes_dest = torch.from_numpy(SAM_bboxes_dest.astype(np.float32)) # x1, y1, w, h
-        h_factor = self.h2 / H_masks
-        w_factor = self.w2 / W_masks
+        
+        # For bbox scaling, we need the original mask dimensions from conversion stats
+        original_H = conversion_stats.get('original_height', self.h2)  
+        original_W = conversion_stats.get('original_width', self.w2)
+        h_factor = self.h2 / original_H if original_H > 0 else 1.0
+        w_factor = self.w2 / original_W if original_W > 0 else 1.0
+        
         if h_factor != 1 or w_factor != 1:
             SAM_bboxes_dest[:, 0] = SAM_bboxes_dest[:, 0] * w_factor
             SAM_bboxes_dest[:, 1] = SAM_bboxes_dest[:, 1] * h_factor
@@ -278,25 +456,32 @@ class Masks_Dataset(Dataset):
 
         if self.train_mode:  # Training: Construct 1 positive + 31 negative batch for contrastive learning
             visible_pixels = mask2_GT.sum()  # Check if object is visible in destination image
+            
+            # Convert indexed masks to binary format for training operations that need individual masks
+            SAM_masks_binary = self.mask_converter.indexed_to_binary(SAM_masks_indexed, N_masks)
+            
             # If the object is visible in the destination image, we select the best SAM mask as the positive mask
             if visible_pixels > 0:  # Case 1: Object is visible - use GT as strong positive
-                NEG_SAM_masks, NEG_SAM_bboxes = self.select_adjacent_negatives(adj_matrix, SAM_bboxes_dest, SAM_masks, mask2_GT)  # Hard negative mining using adjacency
+                NEG_SAM_masks, NEG_SAM_bboxes = self.select_adjacent_negatives(adj_matrix, SAM_bboxes_dest, SAM_masks_binary, mask2_GT)  # Hard negative mining using adjacency
                 is_visible = torch.tensor(1.) # True
                 POS_SAM_masks = mask2_GT # Choose the GT (Strong Positive) or the best SAM mask (Weak Positive) TODO
                 POS_SAM_bboxes, _ = bbox_from_mask(mask2_GT) # x1, y1, w, h
             else:  # Case 2: Object not visible - random selection for negative learning
                 N_remaining_indices = self.N_masks_per_batch - 1  # Need 31 negatives
-                if SAM_masks.shape[0] < N_remaining_indices:  # If not enough masks, use replacement
-                    random_indices = np.random.choice(SAM_masks.shape[0], N_remaining_indices, replace=True)
+                if N_masks < N_remaining_indices:  # If not enough masks, use replacement
+                    random_indices = np.random.choice(N_masks, N_remaining_indices, replace=True)
                 else:  # Sufficient masks, no replacement needed
-                    random_indices = np.random.choice(SAM_masks.shape[0], N_remaining_indices, replace=False)
+                    random_indices = np.random.choice(N_masks, N_remaining_indices, replace=False)
                 
-                NEG_SAM_masks = SAM_masks[random_indices]  # Random negatives
+                NEG_SAM_masks = SAM_masks_binary[random_indices]  # Random negatives
                 NEG_SAM_bboxes = SAM_bboxes_dest[random_indices]
                 is_visible = torch.tensor(0.) #False
-                random_idx = np.random.randint(SAM_masks.shape[0])  # Pick random mask as fake positive
-                POS_SAM_masks = SAM_masks[random_idx]
+                random_idx = np.random.randint(N_masks)  # Pick random mask as fake positive
+                POS_SAM_masks = SAM_masks_binary[random_idx]
                 POS_SAM_bboxes = SAM_bboxes_dest[random_idx]
+            
+            # Clean up binary masks after use to save memory
+            del SAM_masks_binary
 
             POS_mask_position = random.randint(0, self.N_masks_per_batch - 1) # Random position of the positive mask in the batch (prevent position bias)
             NEG_part1 = NEG_SAM_masks[:POS_mask_position]  # Split negatives: before positive
@@ -309,14 +494,19 @@ class Masks_Dataset(Dataset):
 
         # In validation or test modes, we just return the SAM masks, and precompute which is the best SAM mask
         elif self.val_mode:
-            # First check visibility and find best mask before sampling
+            # For GPU conversion optimization, we'll select mask indices without converting to binary
+            # This requires temporarily converting to compute IoU for best mask selection
             visible_pixels = mask2_GT.sum()
             if visible_pixels > 0:  # Object is visible - ensure best mask is included
                 is_visible = torch.tensor(1.) # True
-                best_original = self.get_best_mask(SAM_masks, mask2_GT)
+                # Temporarily convert to binary just for IoU computation
+                with torch.no_grad():
+                    SAM_masks_binary_temp = self.mask_converter.indexed_to_binary(SAM_masks_indexed, N_masks)
+                    best_original = self.get_best_mask(SAM_masks_binary_temp, mask2_GT)
+                    del SAM_masks_binary_temp  # Clean up immediately
                 
                 # Sample remaining masks (N_masks_per_batch - 1) excluding best_original
-                remaining_indices = np.setdiff1d(np.arange(SAM_masks.shape[0]), [best_original])
+                remaining_indices = np.setdiff1d(np.arange(N_masks), [best_original])
                 N_remaining = self.N_masks_per_batch - 1
                 
                 if len(remaining_indices) >= N_remaining:
@@ -333,22 +523,32 @@ class Masks_Dataset(Dataset):
             else:  # Object not visible - random sampling
                 is_visible = torch.tensor(0.) # False
                 POS_mask_position = 0
-                if SAM_masks.shape[0] >= self.N_masks_per_batch:
-                    random_indices = np.random.choice(SAM_masks.shape[0], self.N_masks_per_batch, replace=False)
+                if N_masks >= self.N_masks_per_batch:
+                    random_indices = np.random.choice(N_masks, self.N_masks_per_batch, replace=False)
                 else:
-                    random_indices = np.random.choice(SAM_masks.shape[0], self.N_masks_per_batch, replace=True)
+                    random_indices = np.random.choice(N_masks, self.N_masks_per_batch, replace=True)
             
-            DEST_SAM_masks = SAM_masks[random_indices]
+            # Store the selected indices and pass indexed masks
+            DEST_SAM_masks = SAM_masks_indexed  # Keep as indexed format
+            DEST_SAM_masks_indices = random_indices
             DEST_SAM_bboxes = SAM_bboxes_dest[random_indices]
                 
-        else:
-            DEST_SAM_masks = SAM_masks
+        else:  # Test mode
+            # For test mode, we need all masks, so just pass the indexed format
+            DEST_SAM_masks = SAM_masks_indexed  # Keep as indexed format
+            DEST_SAM_masks_indices = np.arange(N_masks)  # All mask indices
+            
             visible_pixels = mask2_GT.sum()
             if visible_pixels > 0:
                 is_visible = torch.tensor(1.) # True
+                # Temporarily convert to find best mask
+                with torch.no_grad():
+                    SAM_masks_binary_temp = self.mask_converter.indexed_to_binary(SAM_masks_indexed, N_masks)
+                    POS_mask_position = self.get_best_mask(SAM_masks_binary_temp, mask2_GT)
+                    del SAM_masks_binary_temp
             else:
                 is_visible = torch.tensor(0.) # False
-            POS_mask_position = self.get_best_mask(SAM_masks, mask2_GT)
+                POS_mask_position = 0
             DEST_SAM_bboxes = SAM_bboxes_dest
             if len(DEST_SAM_bboxes.shape) == 1:
                 DEST_SAM_bboxes = torch.zeros((1, 4))
@@ -383,12 +583,23 @@ class Masks_Dataset(Dataset):
         # Force garbage collection to actually free memory
         gc.collect()
 
-        return {'SOURCE_img': img1_torch, 'SOURCE_mask': mask_SOURCE, 'SOURCE_bbox': bbox_from_mask(mask_SOURCE)[0], 'SOURCE_img_size': torch.tensor([self.h1, self.w1]),
-                'GT_img': img2_torch, 'GT_mask': mask2_GT, 
-                'DEST_SAM_masks': DEST_SAM_masks, 'DEST_SAM_bbox': DEST_SAM_bboxes, 'DEST_img_size': torch.tensor([self.h2, self.w2]),
-                'is_visible': is_visible, 'POS_mask_position': torch.tensor(POS_mask_position),
-                'pair_idx': torch.tensor(idx_sample),
-                'img_pth1': img_pth1, 'img_pth2': img_pth2}
+        # Prepare return data based on mode
+        return_data = {
+            'SOURCE_img': img1_torch, 'SOURCE_mask': mask_SOURCE, 'SOURCE_bbox': bbox_from_mask(mask_SOURCE)[0], 'SOURCE_img_size': torch.tensor([self.h1, self.w1]),
+            'GT_img': img2_torch, 'GT_mask': mask2_GT, 
+            'DEST_SAM_masks': DEST_SAM_masks, 'DEST_SAM_bbox': DEST_SAM_bboxes, 'DEST_img_size': torch.tensor([self.h2, self.w2]),
+            'is_visible': is_visible, 'POS_mask_position': torch.tensor(POS_mask_position),
+            'pair_idx': torch.tensor(idx_sample),
+            'img_pth1': img_pth1, 'img_pth2': img_pth2
+        }
+        
+        # Add metadata for GPU conversion if not in training mode
+        if not self.train_mode:
+            return_data['DEST_SAM_masks_indices'] = torch.tensor(DEST_SAM_masks_indices)
+            return_data['DEST_SAM_masks_num'] = torch.tensor(N_masks)
+            return_data['DEST_SAM_masks_indexed'] = True  # Flag to indicate indexed format
+        
+        return return_data
 
 
 def check_size(var, varname):

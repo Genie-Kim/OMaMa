@@ -106,8 +106,71 @@ class DescriptorExtractor:
         dense_features = torch.nn.functional.interpolate(feats_DEST_img, 
                                                             size = (int(h * self.patch_size / reduction_factor), int(w * self.patch_size / reduction_factor)), 
                                                             mode='bilinear', align_corners=False)
+        
+        # Handle indexed mask format for GPU conversion optimization
+        if 'DEST_SAM_masks_indexed' in batch and batch['DEST_SAM_masks_indexed']:
+            try:
+                # Import GPU processor for indexed mask conversion
+                from utils.gpu_mask_processor import GPUMaskProcessor
+                
+                # Create GPU processor instance if not already created
+                if not hasattr(self, 'gpu_mask_processor'):
+                    self.gpu_mask_processor = GPUMaskProcessor(device=self.device, enable_profiling=False)
+                
+                # Convert indexed masks to binary format on GPU
+                batch_size = len(batch['DEST_SAM_masks'])
+                binary_masks_list = []
+                
+                for b in range(batch_size):
+                    indexed_mask = batch['DEST_SAM_masks'][b].to(self.device)
+                    mask_indices = batch['DEST_SAM_masks_indices'][b]
+                    num_masks = batch['DEST_SAM_masks_num'][b].item()
+                    
+                    # Validate inputs
+                    if num_masks <= 0:
+                        raise ValueError(f"Invalid num_masks: {num_masks} for batch item {b}")
+                    if len(mask_indices) == 0:
+                        raise ValueError(f"Empty mask_indices for batch item {b}")
+                    
+                    # Convert full indexed mask to binary for selected indices
+                    binary_masks_full = self.gpu_mask_processor.process_batch(indexed_mask, num_masks)
+                    # Select only the masks we need based on indices
+                    binary_masks_selected = binary_masks_full[mask_indices]
+                    binary_masks_list.append(binary_masks_selected)
+                
+                # Stack all binary masks into a batch
+                DEST_SAM_masks = torch.stack(binary_masks_list).to(self.device)
+                
+            except Exception as e:
+                # Log error and fallback to CPU conversion
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.error(f"GPU mask conversion failed: {e}. Falling back to CPU processing.")
+                
+                # Fallback to CPU conversion using mask converter
+                from utils.mask_converter import MaskConverter
+                converter = MaskConverter()
+                
+                batch_size = len(batch['DEST_SAM_masks'])
+                binary_masks_list = []
+                
+                for b in range(batch_size):
+                    indexed_mask = batch['DEST_SAM_masks'][b].cpu()
+                    mask_indices = batch['DEST_SAM_masks_indices'][b]
+                    num_masks = batch['DEST_SAM_masks_num'][b].item()
+                    
+                    # Convert on CPU and select indices
+                    binary_masks_full = converter.indexed_to_binary(indexed_mask, num_masks)
+                    binary_masks_selected = binary_masks_full[mask_indices]
+                    binary_masks_list.append(binary_masks_selected.to(self.device))
+                
+                DEST_SAM_masks = torch.stack(binary_masks_list).to(self.device)
+        else:
+            # Standard path for training mode (already binary)
+            DEST_SAM_masks = batch['DEST_SAM_masks'].to(self.device)
+        
         context_DEST_descriptors = self.dense_bbox(batch['DEST_SAM_bbox'], batch['DEST_img_size'], dense_features, context_sizes=[100], reduction_factor=reduction_factor)
-        mask_DEST_descriptors = self.dense_mask(batch['DEST_SAM_masks'], dense_features)
+        mask_DEST_descriptors = self.dense_mask(DEST_SAM_masks, dense_features)
         DEST_descriptors = torch.cat((mask_DEST_descriptors, context_DEST_descriptors), dim=2).to(self.device)
 
         return DEST_descriptors.to(self.device), feats_DEST_img

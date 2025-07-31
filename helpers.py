@@ -16,5 +16,21 @@ def set_all_seeds(seed):
     torch.backends.cudnn.deterministic = True
 
 def our_collate_fn(batch):
-    return {key: torch.stack([sample[key] for sample in batch]) for key in batch[0]}
+    """Custom collate function that handles both standard tensors and indexed mask format"""
+    collated = {}
+    
+    for key in batch[0]:
+        # Special handling for indexed masks in val/test mode
+        if key == 'DEST_SAM_masks' and 'DEST_SAM_masks_indexed' in batch[0] and batch[0]['DEST_SAM_masks_indexed']:
+            # For indexed masks, we need to handle them differently since they may have different shapes
+            # Just pass them as a list to be processed later
+            collated[key] = [sample[key] for sample in batch]
+        elif key == 'DEST_SAM_masks_indexed':
+            # Just take the first value since it should be the same for all samples in the batch
+            collated[key] = batch[0][key]
+        else:
+            # Standard stacking for other tensors
+            collated[key] = torch.stack([sample[key] for sample in batch])
+    
+    return collated
 

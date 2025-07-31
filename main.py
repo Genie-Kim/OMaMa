@@ -90,7 +90,7 @@ def select_qualitative_samples(val_dataset, num_takes=3, frames_per_take=5, user
 
 def run_validation(model, descriptor_extractor, val_dataloader, val_dataset, 
                    args, qualitative_dir, exp_dir, exp_name, current_epoch, 
-                   global_step, best_IoU, DEBUG_MODE, qualitative_selections):
+                   global_step, best_IoU, DEBUG_MODE, qualitative_selections, device):
     """Run validation and save checkpoints"""
     # Validation loop
     processed_epoch, pred_json_epoch, gt_json_epoch = {}, {}, {}
@@ -101,58 +101,124 @@ def run_validation(model, descriptor_extractor, val_dataloader, val_dataset,
         with torch.no_grad():
             DEST_descriptors, DEST_img_feats = descriptor_extractor.get_DEST_descriptors(batch)
             SOURCE_descriptors, SOURCE_img_feats = descriptor_extractor.get_SOURCE_descriptors(batch)
-            similarities, pred_masks_idx, refined_mask, loss, top5_masks = model(SOURCE_descriptors, DEST_descriptors, 
-                                                                                 SOURCE_img_feats, DEST_img_feats, 
-                                                                                 batch['POS_mask_position'], batch['is_visible'],
-                                                                                 batch['DEST_SAM_masks'], test_mode = False)
+            # Handle mask parameter for model - provide binary masks for training mode or dummy for val/test
+            if 'DEST_SAM_masks_indexed' in batch and batch['DEST_SAM_masks_indexed']:
+                # For indexed format in val/test, pass a dummy tensor since model only uses it for final mask extraction
+                # We'll handle mask extraction separately in the loop below
+                dummy_masks = torch.zeros((batch['GT_img'].shape[0], 32, 512, 512), device=device, dtype=torch.uint8)
+                similarities, pred_masks_idx, refined_mask, loss, top5_masks = model(SOURCE_descriptors, DEST_descriptors, 
+                                                                                     SOURCE_img_feats, DEST_img_feats, 
+                                                                                     batch['POS_mask_position'], batch['is_visible'],
+                                                                                     dummy_masks, test_mode = False)
+            else:
+                # Standard path for training mode
+                similarities, pred_masks_idx, refined_mask, loss, top5_masks = model(SOURCE_descriptors, DEST_descriptors, 
+                                                                                     SOURCE_img_feats, DEST_img_feats, 
+                                                                                     batch['POS_mask_position'], batch['is_visible'],
+                                                                                     batch['DEST_SAM_masks'], test_mode = False)
             # Extract predicted masks for each sample in batch using pred_masks_idx
-            batch_size = batch['DEST_SAM_masks'].shape[0]
+            batch_size = batch['GT_img'].shape[0]  # Use GT_img for batch size since DEST_SAM_masks might be a list
             confidence = similarities.detach().cpu().numpy()
             
             epoch_loss += loss.item()
             
-            # Process each sample in the batch
-            for b in range(batch_size):
-                # Extract predicted mask for this batch sample
-                mask_idx = pred_masks_idx[b].item()
-                pred_mask = batch['DEST_SAM_masks'][b, mask_idx, :, :].detach().cpu().numpy()
+            # Handle indexed mask format for validation
+            if 'DEST_SAM_masks_indexed' in batch and batch['DEST_SAM_masks_indexed']:
+                # Import GPU processor for indexed mask conversion
+                from utils.gpu_mask_processor import GPUMaskProcessor
                 
-                # Add to evaluation JSON
-                sample_pair_idx = batch['pair_idx'][b].item()
-                sample_confidence = confidence[b] if len(confidence.shape) > 0 else confidence
-                pred_json_epoch, gt_json_epoch = add_to_json(
-                    batch['img_pth1'][b], batch['img_pth2'][b], 
-                    batch['GT_mask'][b].detach().cpu().numpy(), args.reverse,
-                    pred_mask, sample_confidence,
-                    processed_epoch, pred_json_epoch, gt_json_epoch)
+                # Create GPU processor instance if not already created
+                if not hasattr(descriptor_extractor, 'gpu_mask_processor'):
+                    descriptor_extractor.gpu_mask_processor = GPUMaskProcessor(device=device, enable_profiling=False)
                 
-                # Generate qualitative outputs for pre-selected samples
-                # Extract take_id, camera_name, object_name, and frame_idx from the image path
-                img_path, _, _, _ = val_dataset.pairs[sample_pair_idx]
-                _, take_id, camera_name, object_name, _, frame_idx = img_path.split('//')
-                frame_idx = int(frame_idx)
-                
-                # Check if this sample is in pre-selected qualitative samples
-                if take_id in qualitative_selections:
-                    # Check if this specific (camera_name, object_name, frame_idx) is selected
-                    selected_pairs = qualitative_selections[take_id]
-                    if any(camera_name == sel_camera and object_name == sel_object and frame_idx == sel_frame 
-                           for sel_camera, sel_object, sel_frame in selected_pairs):
-                        # Create batch-specific data for visualization
-                        sample_batch = {
-                            'SOURCE_img': batch['SOURCE_img'][b:b+1],
-                            'GT_img': batch['GT_img'][b:b+1], 
-                            'SOURCE_mask': batch['SOURCE_mask'][b:b+1],
-                            'GT_mask': batch['GT_mask'][b:b+1]
-                        }
-                        # Collect qualitative data for batch processing
-                        qualitative_data.append({
-                            'sample_batch': sample_batch,
-                            'pred_mask': pred_mask,
-                            'take_id': take_id,
-                            'object_name': object_name,
-                            'frame_idx': frame_idx
-                        })
+                # Process each sample in the batch
+                for b in range(batch_size):
+                    try:
+                        # Get indexed mask and convert to binary on GPU for prediction extraction
+                        indexed_mask = batch['DEST_SAM_masks'][b].to(device)
+                        mask_indices = batch['DEST_SAM_masks_indices'][b]
+                        num_masks = batch['DEST_SAM_masks_num'][b].item()
+                        
+                        # Validate inputs
+                        if num_masks <= 0:
+                            raise ValueError(f"Invalid num_masks: {num_masks} for batch item {b}")
+                        if len(mask_indices) == 0:
+                            raise ValueError(f"Empty mask_indices for batch item {b}")
+                        if pred_masks_idx[b].item() >= len(mask_indices):
+                            raise ValueError(f"pred_masks_idx {pred_masks_idx[b].item()} out of range for mask_indices length {len(mask_indices)}")
+                        
+                        # Convert indexed mask to binary format on GPU
+                        binary_masks_full = descriptor_extractor.gpu_mask_processor.process_batch(indexed_mask, num_masks)
+                        # Select only the masks we need based on indices
+                        binary_masks_selected = binary_masks_full[mask_indices]
+                        
+                        # Extract predicted mask for this batch sample
+                        mask_idx = pred_masks_idx[b].item()
+                        pred_mask = binary_masks_selected[mask_idx, :, :].detach().cpu().numpy()
+                        
+                    except Exception as e:
+                        # Log error and create dummy mask as fallback
+                        import logging
+                        logger = logging.getLogger(__name__)
+                        logger.error(f"GPU mask conversion failed for batch item {b}: {e}. Using dummy mask.")
+                        
+                        # Create dummy mask filled with zeros
+                        pred_mask = np.zeros((batch['GT_mask'][b].shape[0], batch['GT_mask'][b].shape[1]), dtype=np.uint8)
+                    
+                    # Add to evaluation JSON
+                    sample_pair_idx = batch['pair_idx'][b].item()
+                    sample_confidence = confidence[b] if len(confidence.shape) > 0 else confidence
+                    
+                    pred_json_epoch, gt_json_epoch = add_to_json(
+                        batch['img_pth1'][b], batch['img_pth2'][b], 
+                        batch['GT_mask'][b].detach().cpu().numpy(), args.reverse,
+                        pred_mask, sample_confidence,
+                        processed_epoch, pred_json_epoch, gt_json_epoch)
+            else:
+                # Standard path for training mode (already binary)
+                # Process each sample in the batch
+                for b in range(batch_size):
+                    # Extract predicted mask for this batch sample
+                    mask_idx = pred_masks_idx[b].item()
+                    pred_mask = batch['DEST_SAM_masks'][b, mask_idx, :, :].detach().cpu().numpy()
+                    
+                    # Add to evaluation JSON
+                    sample_pair_idx = batch['pair_idx'][b].item()
+                    sample_confidence = confidence[b] if len(confidence.shape) > 0 else confidence
+                    
+                    pred_json_epoch, gt_json_epoch = add_to_json(
+                        batch['img_pth1'][b], batch['img_pth2'][b], 
+                        batch['GT_mask'][b].detach().cpu().numpy(), args.reverse,
+                        pred_mask, sample_confidence,
+                        processed_epoch, pred_json_epoch, gt_json_epoch)
+                    
+                    # Generate qualitative outputs for pre-selected samples
+                    # Extract take_id, camera_name, object_name, and frame_idx from the image path
+                    img_path, _, _, _ = val_dataset.pairs[sample_pair_idx]
+                    _, take_id, camera_name, object_name, _, frame_idx = img_path.split('//')
+                    frame_idx = int(frame_idx)
+                    
+                    # Check if this sample is in pre-selected qualitative samples
+                    if take_id in qualitative_selections:
+                        # Check if this specific (camera_name, object_name, frame_idx) is selected
+                        selected_pairs = qualitative_selections[take_id]
+                        if any(camera_name == sel_camera and object_name == sel_object and frame_idx == sel_frame 
+                               for sel_camera, sel_object, sel_frame in selected_pairs):
+                            # Create batch-specific data for visualization
+                            sample_batch = {
+                                'SOURCE_img': batch['SOURCE_img'][b:b+1],
+                                'GT_img': batch['GT_img'][b:b+1], 
+                                'SOURCE_mask': batch['SOURCE_mask'][b:b+1],
+                                'GT_mask': batch['GT_mask'][b:b+1]
+                            }
+                            # Collect qualitative data for batch processing
+                            qualitative_data.append({
+                                'sample_batch': sample_batch,
+                                'pred_mask': pred_mask,
+                                'take_id': take_id,
+                                'object_name': object_name,
+                                'frame_idx': frame_idx
+                            })
 
             
             # Debug mode: limit validation iterations
@@ -403,7 +469,7 @@ if __name__ == "__main__":
             # Run validation
             best_IoU = run_validation(model, descriptor_extractor, val_dataloader, val_dataset,
                                      args, qualitative_dir, exp_dir, exp_name, current_epoch,
-                                     global_step, best_IoU, DEBUG_MODE, qualitative_selections)
+                                     global_step, best_IoU, DEBUG_MODE, qualitative_selections, device)
 
         # Training
         model.train()
