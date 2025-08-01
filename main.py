@@ -34,7 +34,7 @@ def select_qualitative_samples(val_dataset, num_takes=3, frames_per_take=5, user
     }
     else, select the samples randomly
     """
-    random.seed(49)
+    random.seed(42)
     # Group pairs by take_id
     take_to_pairs = {}
     for idx, pair in enumerate(val_dataset.pairs):
@@ -305,6 +305,34 @@ def create_qualitative_visualization(data_list, qualitative_dir, data_id_prefix)
         return str(save_file)
     
     return None
+
+
+"""
+Exo to Ego setting
+- Patch_size: 14
+- Context size: 20
+- N_masks_per_batch: 32
+- Batch_size: 24
+- Order: 2
+- Lr: 8e-5
+- Max_iterations: 10000
+- eval step: 500
+
+Ego to Exo setting
+- Patch_size: 14
+- Context size: 20
+- N_masks_per_batch: 32
+- Batch_size: 36
+- Order: 2
+- Lr: 2e-6
+- Max_iterations: 4000
+- eval step: 500
+
+python main.py --batch_size 36 --lr 5e-7 --max_iterations 4000 --devices 2 --exp_name Ego2Exo_1e-6_4000
+python main.py --batch_size 36 --lr 1e-7 --max_iterations 4000 --devices 1 --exp_name Ego2Exo_1e-7_4000
+python main.py --batch_size 36 --lr 2e-6 --max_iterations 4000 --devices 1 --exp_name Ego2Exo_2e-6_4000
+"""
+
 
 
 if __name__ == "__main__":
