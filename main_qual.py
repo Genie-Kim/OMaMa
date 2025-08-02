@@ -195,7 +195,7 @@ if __name__ == "__main__":
     # Load model
     descriptor_extractor = DescriptorExtractor('dinov2_vitb14_reg',  args.patch_size, args.context_size, device)
     model = Attention_projector(args.reverse).to(device)
-    checkpoint_weights = torch.load((args.checkpoint_dir))
+    checkpoint_weights = torch.load(args.checkpoint_dir, map_location=device)
     model.load_state_dict(checkpoint_weights, strict=False)
     print(model)
     
@@ -293,7 +293,7 @@ if __name__ == "__main__":
 
         print(f"Processing all test samples for qualitative visualization...")
         print(f"Total samples to process: {len(test_dataset)}")
-        test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=8, pin_memory=True, prefetch_factor=8)
+        test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=32, pin_memory=True, prefetch_factor=8)
         
         for batch_idx, batch in enumerate(tqdm(test_dataloader, desc="Processing samples")):
             # Extract path information to get take_id and frame_idx

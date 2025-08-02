@@ -328,7 +328,9 @@ Ego to Exo setting
 - Max_iterations: 4000
 - eval step: 500
 
+# best setting
 python main.py --batch_size 36 --lr 5e-7 --max_iterations 4000 --devices 2 --exp_name Ego2Exo_1e-6_4000
+
 python main.py --batch_size 36 --lr 1e-7 --max_iterations 4000 --devices 1 --exp_name Ego2Exo_1e-7_4000
 python main.py --batch_size 36 --lr 2e-6 --max_iterations 4000 --devices 1 --exp_name Ego2Exo_2e-6_4000
 """

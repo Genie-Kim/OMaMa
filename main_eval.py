@@ -63,11 +63,11 @@ if __name__ == "__main__":
     
     
     test_dataset = Masks_Dataset(args.root, args.patch_size, args.reverse, N_masks_per_batch=args.N_masks_per_batch,order = args.order, train=False, val=False, test = True)
-    test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=16, pin_memory=True, prefetch_factor=16)
+    test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=32, pin_memory=True, prefetch_factor=8)
 
     descriptor_extractor = DescriptorExtractor('dinov2_vitb14_reg',  args.patch_size, args.context_size, device)
     model = Attention_projector(args.reverse).to(device)
-    checkpoint_weights = torch.load((args.checkpoint_dir))
+    checkpoint_weights = torch.load(args.checkpoint_dir, map_location=device)
     model.load_state_dict(checkpoint_weights, strict=False)
     print(model)
     
